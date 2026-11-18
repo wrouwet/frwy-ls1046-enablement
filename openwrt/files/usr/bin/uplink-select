@@ -1,0 +1,197 @@
+#!/bin/sh
+# Picks the best known Wi-Fi uplink and the channel to run on.
+#
+# Every wifi-iface with mode 'sta' in /etc/config/wireless is a known uplink.
+# The strongest one in a scan wins, skipping the 5 GHz DFS channels (52-144):
+# this radio's AP cannot do the radar check those need, and the AP has to
+# share the uplink's channel. The chosen station is enabled and pinned to that
+# access point, the others are disabled, and the radio is moved to its channel.
+# A 5 GHz access point is preferred unless it is more than PREFER_5G_DB
+# weaker. The radio takes the country code the chosen access point advertises,
+# so channel rules follow wherever the box is used.
+#
+# Usage: uplink-select          pick once (does nothing if the choice stands)
+#        uplink-select daemon   pick at start, then re-pick after 3 minutes
+#                               without internet
+
+PHY=phy0
+RADIO=radio0
+SCAN_IF=uscan
+SCAN=/tmp/uplink-scan.txt
+CHECK_URL=http://connectivitycheck.gstatic.com/generate_204
+PREFER_5G_DB=6
+
+log() { logger -t uplink-select "$*"; }
+
+# Writes "signal freq bssid country ssid" lines for every BSS the radio hears;
+# country is "--" when the access point doesn't advertise one.
+scan() {
+	# Scan on the running station interface if there is one; otherwise add a
+	# temporary one, with its own MAC address so it can come up next to the AP.
+	local dev temp= i
+	dev=$(iw dev | awk -v phy="phy#${PHY#phy}" '
+		$0 ~ "^" phy { on = 1; next } /^phy#/ { on = 0 }
+		on && /Interface/ { i = $2 } on && /type managed/ { print i; exit }')
+	if [ -z "$dev" ]; then
+		dev=$SCAN_IF temp=1
+		iw phy $PHY interface add $dev type managed 2>/dev/null
+		ip link set $dev address 02:$(hexdump -n 5 -e '5/1 ":%02x"' /dev/urandom | cut -c2-) 2>/dev/null
+		ip link set $dev up 2>/dev/null
+	fi
+	for i in 1 2 3; do
+		iw dev $dev scan > $SCAN 2>/dev/null && break
+		sleep 2
+	done
+	if [ -n "$temp" ]; then
+		ip link set $dev down 2>/dev/null
+		iw dev $dev del 2>/dev/null
+	fi
+	awk '
+		function out() { if (b != "") print s, f, b, (c == "" ? "--" : c), n }
+		/^BSS / { out(); b = substr($2, 1, 17); f = ""; s = ""; n = ""; c = "" }
+		/^\tfreq:/ { f = int($2) }
+		/^\tsignal:/ { s = int($2) }
+		/^\tSSID:/ { n = substr($0, index($0, ":") + 2) }
+		/^\tCountry:/ { c = $2 }
+		END { out() }
+	' $SCAN
+}
+
+usable_freq() {
+	# 2.4 GHz, and 5 GHz outside the DFS range (5260-5720 MHz).
+	[ "$1" -ge 2400 ] && [ "$1" -le 2500 ] && return 0
+	[ "$1" -ge 5100 ] && [ "$1" -lt 5260 ] && return 0
+	[ "$1" -gt 5720 ] && [ "$1" -le 5900 ] && return 0
+	return 1
+}
+
+# Prints the station sections, one per line.
+sta_sections() {
+	uci show wireless | sed -n "s/^wireless\.\([^.]*\)\.mode='sta'$/\1/p"
+}
+
+select_uplink() {
+	local best_score=-999 best_sig= best_sec= best_bssid= best_freq= best_cc=
+	local sec ssid sig freq bssid cc name score
+	local results
+	results=$(scan)
+	if [ -z "$results" ]; then
+		log "scan found nothing; keeping the current setup"
+		return 1
+	fi
+	for sec in $(sta_sections); do
+		ssid=$(uci -q get wireless.$sec.ssid)
+		echo "$results" | while read -r sig freq bssid cc name; do
+			[ "$name" = "$ssid" ] && echo "$sig $freq $bssid $cc"
+		done > /tmp/uplink-cand
+		while read -r sig freq bssid cc; do
+			usable_freq "$freq" || continue
+			score=$sig
+			[ "$freq" -gt 3000 ] && score=$((sig + PREFER_5G_DB))
+			if [ "$score" -gt "$best_score" ]; then
+				best_score=$score best_sig=$sig best_sec=$sec
+				best_bssid=$bssid best_freq=$freq best_cc=$cc
+			fi
+		done < /tmp/uplink-cand
+	done
+	if [ -z "$best_sec" ]; then
+		log "no known network heard on a usable channel; keeping the current setup"
+		return 1
+	fi
+
+	local band channel htmode
+	if [ "$best_freq" -lt 3000 ]; then
+		band=2g
+		channel=$(( (best_freq - 2407) / 5 ))
+		[ "$best_freq" = 2484 ] && channel=14
+		htmode=HT20
+	else
+		band=5g
+		channel=$(( (best_freq - 5000) / 5 ))
+		# 20 MHz: the AP has to share the uplink's channel, and a narrow
+		# width fits whatever width the uplink uses.
+		htmode=VHT20
+	fi
+
+	local changed=0
+	set_opt() {
+		local cur
+		cur=$(uci -q get "$1")
+		# An unset "disabled" means enabled.
+		[ -z "$cur" ] && [ "${1##*.}" = disabled ] && cur=0
+		[ "$cur" = "$2" ] && return
+		uci set "$1=$2"
+		changed=1
+	}
+	for sec in $(sta_sections); do
+		if [ "$sec" = "$best_sec" ]; then
+			set_opt wireless.$sec.disabled 0
+			set_opt wireless.$sec.bssid "$best_bssid"
+		else
+			set_opt wireless.$sec.disabled 1
+		fi
+	done
+	set_opt wireless.$RADIO.band $band
+	set_opt wireless.$RADIO.channel $channel
+	set_opt wireless.$RADIO.htmode $htmode
+	case "$best_cc" in
+	[A-Z][A-Z]) set_opt wireless.$RADIO.country "$best_cc" ;;
+	esac
+
+	if [ "$changed" = 1 ]; then
+		uci commit wireless
+		log "switching to $(uci -q get wireless.$best_sec.ssid) $best_bssid, $best_freq MHz (channel $channel), $best_sig dBm"
+		wifi reload
+	else
+		uci revert wireless
+		log "staying on $(uci -q get wireless.$best_sec.ssid) $best_bssid, $best_freq MHz, $best_sig dBm"
+	fi
+}
+
+# Resets the radio when the driver is stuck: the QCA6174 firmware can crash
+# when interfaces are reconfigured and does not always come back by itself.
+recover_radio() {
+	log "uplink still down; reloading the Wi-Fi driver"
+	wifi down
+	rmmod ath10k_pci 2>/dev/null
+	rmmod ath10k_core 2>/dev/null
+	sleep 2
+	modprobe ath10k_pci
+	sleep 5
+	wifi up
+}
+
+uplink_up() {
+	ifstatus wwan 2>/dev/null | grep -q '"up": true'
+}
+
+online() {
+	wget -q -T 5 -O /dev/null "$CHECK_URL" 2>/dev/null
+}
+
+case "$1" in
+daemon)
+	# Give the radio time to come up after boot.
+	sleep 20
+	select_uplink
+	failures=0
+	while true; do
+		sleep 60
+		if online; then
+			failures=0
+		else
+			failures=$((failures + 1))
+			log "no internet ($failures)"
+			if [ "$failures" -ge 3 ]; then
+				select_uplink
+				sleep 45
+				uplink_up || recover_radio
+				failures=0
+			fi
+		fi
+	done
+	;;
+*)
+	select_uplink
+	;;
+esac

@@ -1,0 +1,33 @@
+package fstab
+
+config global
+	option anon_swap '0'
+	option anon_mount '0'
+	option auto_swap '1'
+	option auto_mount '1'
+	option delay_root '5'
+	option check_fs '0'
+
+config mount
+	option target '/overlay'
+	option uuid '8d0cd25e-c91c-44db-9fe4-1857df2a3341'
+	option enabled '0'
+
+config mount
+	option target '/mnt/mmcblk0p1'
+	option uuid '84173db5-fa99-e35a-95c6-28613cc79ea9'
+	option enabled '0'
+
+config mount
+	option target '/rom'
+	option uuid 'c8e63b4f-86c045bc-b2c91a56-042e4b75'
+	option enabled '0'
+
+config mount 'extroot'
+	option uuid 'babf4c93-686c-4282-92d6-20c2ca1c75e5'
+	option target '/overlay'
+
+config mount 'rwm'
+	option device '/dev/loop0'
+	option target '/rwm'
+

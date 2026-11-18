@@ -1,0 +1,13 @@
+# Large or private files that stay local
+downloads/
+backup/
+*.img
+*.img.zst
+*.img.gz
+*.tgz
+ROOT-PASSWORD.txt
+secrets*
+# Runtime files of host/console.py
+host/console.log
+host/console.in
+__pycache__/

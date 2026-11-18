@@ -1,0 +1,25 @@
+package network
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	list ipaddr '127.0.0.1/8'
+
+config globals 'globals'
+	option dhcp_default_duid '00041b6424c529b644aeb40b652c94d2bea0'
+	option ula_prefix 'fd6c:94e7:8d06::/48'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	option ports 'eth0 eth1 eth2 eth3'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.50.1/24'
+	option ip6assign '60'
+
+config interface 'wwan'
+	option proto 'dhcp'
+

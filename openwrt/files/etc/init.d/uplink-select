@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# Runs uplink-select at boot and keeps it watching the internet connection.
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/bin/uplink-select daemon
+	procd_set_param respawn
+	procd_close_instance
+}
