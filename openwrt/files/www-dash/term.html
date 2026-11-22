@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Console">
+<title>Router Console</title>
+<link rel="stylesheet" href="xterm/xterm.css">
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3; overflow: hidden;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  #bar { position: absolute; top: 0; left: 0; right: 0; height: 52px; padding: 6px 8px;
+    background: #161b22; border-bottom: 1px solid #30363d; white-space: nowrap; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; }
+  #bar button { font: 600 16px -apple-system, Helvetica, sans-serif; color: #e6edf3; background: #21262d;
+    border: 1px solid #30363d; border-radius: 7px; height: 40px; min-width: 48px; padding: 0 12px;
+    margin-right: 5px; -webkit-appearance: none; }
+  #bar button:active, #bar button.on { background: #1f6feb; border-color: #1f6feb; }
+  #bar .sep { display: inline-block; width: 10px; }
+  #bar a { color: #8b949e; font-size: 15px; text-decoration: none; margin: 0 8px; vertical-align: middle; }
+  #st { color: #8b949e; font-size: 13px; margin-left: 6px; vertical-align: middle; }
+  #wrap { position: absolute; top: 52px; left: 0; right: 0; bottom: 56px; padding: 4px 6px; }
+  #wrap.kb { bottom: 50%; }
+  #inrow { position: absolute; left: 0; right: 0; bottom: 0; height: 56px; padding: 7px 8px;
+    background: #161b22; border-top: 1px solid #30363d; display: -webkit-flex; display: flex; }
+  #inrow.kb { bottom: auto; top: 50%; margin-top: -56px; }
+  #inp { -webkit-flex: 1; flex: 1; min-width: 0; height: 42px; font: 18px Menlo, Courier, monospace; color: #e6edf3;
+    background: #0d1117; border: 1px solid #30363d; border-radius: 7px; padding: 0 10px; -webkit-appearance: none; outline: none; }
+  #inp:focus { border-color: #1f6feb; }
+  #send { margin-left: 6px; height: 42px; padding: 0 16px; font: 600 16px -apple-system, Helvetica, sans-serif;
+    color: #fff; background: #238636; border: 0; border-radius: 7px; -webkit-appearance: none; }
+  #term { width: 100%; height: 100%; }
+  .xterm .xterm-viewport { background-color: #0d1117 !important; }
+  #bar { scrollbar-width: none; } #bar::-webkit-scrollbar { display: none; }
+</style>
+<script>
+window.onerror = function (msg, src, line, col) {
+  var t = 'JS error: ' + msg + ' @' + String(src).split('/').pop() + ':' + line + ':' + col;
+  try { (new Image()).src = 'http://' + location.hostname + ':8080/cgi-bin/jslog?' + encodeURIComponent(navigator.userAgent.slice(0,60) + ' | ' + t); } catch (e) {}
+  var d = document.createElement('div');
+  d.style.cssText = 'position:fixed;left:0;right:0;bottom:0;background:#f85149;color:#fff;padding:8px;font:14px monospace;z-index:99';
+  d.textContent = t; (document.body || document.documentElement).appendChild(d);
+};
+(new Image()).src = 'http://' + location.hostname + ':8080/cgi-bin/jslog?' + encodeURIComponent('page-load ' + location.port + ' ' + navigator.userAgent.slice(0,80));
+</script>
+</head>
+<body>
+<div id="bar">
+  <a href="/">&#8592; Dashboard</a>
+  <button data-k="esc">Esc</button>
+  <button data-k="tab">Tab</button>
+  <button id="ctrl">Ctrl</button>
+  <span class="sep"></span>
+  <button data-k="up">&#9650;</button>
+  <button data-k="down">&#9660;</button>
+  <button data-k="left">&#9664;</button>
+  <button data-k="right">&#9654;</button>
+  <span class="sep"></span>
+  <button data-s="|">|</button>
+  <button data-s="~">~</button>
+  <button data-s="/">/</button>
+  <button data-s="-">-</button>
+  <button data-k="c-c">^C</button>
+  <button data-k="c-d">^D</button>
+  <span class="sep"></span>
+  <button id="kbd">&#9000; Keyboard</button>
+  <button id="fs-">A-</button>
+  <button id="fs+">A+</button>
+  <span id="st">connecting…</span>
+</div>
+<div id="wrap"><div id="term"></div></div>
+<form id="inrow" action="#" autocomplete="off">
+  <input id="inp" type="text" autocorrect="off" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="type a command, press Return">
+  <button id="send" type="submit">Enter &#9166;</button>
+</form>
+
+<script src="xterm/xterm.js"></script>
+<script src="xterm/fit.js"></script>
+<script>
+(function () {
+  var KEYS = { esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D',
+               'c-c': '\x03', 'c-d': '\x04' };
+  var $ = function (id) { return document.getElementById(id); };
+  var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':7681/ws';
+  var ctrl = false, sock = null, retry = 1000;
+  var fontSize = 18;
+  try { fontSize = parseInt(localStorage.getItem('fs'), 10) || 18; } catch (e) {}
+
+  Terminal.applyAddon(fit);
+  var term = new Terminal({
+    rendererType: 'dom', fontSize: fontSize, fontFamily: 'Menlo, Courier, monospace', cursorBlink: true, scrollback: 2000,
+    theme: { background: '#0d1117', foreground: '#e6edf3', cursor: '#58a6ff', selection: 'rgba(88,166,255,0.3)' }
+  });
+  term.open($('term'));
+  var ta = term.textarea;
+  if (ta) {
+    ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'none');
+    ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false');
+  }
+
+  function st(t) { $('st').textContent = t; }
+
+  function utf8(s) {
+    var b = unescape(encodeURIComponent(s)), u = new Uint8Array(b.length + 1);
+    u[0] = 48; // '0' = INPUT
+    for (var i = 0; i < b.length; i++) u[i + 1] = b.charCodeAt(i);
+    return u;
+  }
+  function sendRaw(s) { if (sock && sock.readyState === 1) sock.send(utf8(s).buffer); }
+  function sendCmd(c, obj) {
+    var s = c + JSON.stringify(obj), u = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
+    if (sock && sock.readyState === 1) sock.send(u.buffer);
+  }
+  function refit() {
+    try { term.fit(); } catch (e) {}
+    sendCmd('1', { columns: term.cols, rows: term.rows });
+  }
+  function setCtrl(on) { ctrl = on; $('ctrl').className = on ? 'on' : ''; }
+
+  term.on('data', function (d) {
+    if (ctrl && d.length === 1) {
+      var c = d.toUpperCase().charCodeAt(0);
+      if (c >= 64 && c <= 95) d = String.fromCharCode(c - 64);
+      setCtrl(false);
+    }
+    sendRaw(d);
+  });
+
+  var inp = $('inp'), recent = '';
+  function setPw(on) {
+    if ((inp.type === 'password') === on) return;
+    inp.type = on ? 'password' : 'text';
+    inp.placeholder = on ? 'password (hidden), press Return' : 'type a command, press Return';
+  }
+  $('inrow').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var v = inp.value; inp.value = '';
+    if (ctrl && v.length === 1) {
+      var c = v.toUpperCase().charCodeAt(0);
+      sendRaw(c >= 64 && c <= 95 ? String.fromCharCode(c - 64) : v); setCtrl(false);
+    } else sendRaw(v + '\r');
+    setPw(false);
+    inp.focus();
+  });
+  $('term').addEventListener('click', function () { inp.focus(); });
+
+  function connect() {
+    st('connecting…');
+    sock = new WebSocket(wsUrl, ['tty']);
+    sock.binaryType = 'arraybuffer';
+    sock.onopen = function () {
+      retry = 1000; st('connected');
+      try { term.fit(); } catch (e) {}
+      var j = JSON.stringify({ AuthToken: '', columns: term.cols, rows: term.rows }), u = new Uint8Array(j.length);
+      for (var i = 0; i < j.length; i++) u[i] = j.charCodeAt(i);
+      sock.send(u.buffer);
+      inp.focus();
+    };
+    sock.onmessage = function (ev) {
+      var u = new Uint8Array(ev.data);
+      if (!u.length) return;
+      if (u[0] === 48) {
+        var body = u.subarray(1);
+        term.writeUtf8(body); // '0' OUTPUT; '1' title, '2' prefs ignored
+        var s = '';
+        for (var i = Math.max(0, body.length - 64); i < body.length; i++) s += String.fromCharCode(body[i]);
+        recent = (recent + s).slice(-64);
+        if (/assword[^\n]*:\s*$/.test(recent)) setPw(true);
+      }
+    };
+    sock.onclose = function () {
+      st('disconnected – reconnecting…');
+      term.write('\r\n\x1b[33m[connection closed]\x1b[0m\r\n');
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 15000);
+    };
+  }
+
+  var btns = document.querySelectorAll('#bar button[data-k], #bar button[data-s]');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].addEventListener('click', function (e) {
+      var k = this.getAttribute('data-k'), s = this.getAttribute('data-s');
+      sendRaw(k ? KEYS[k] : s); inp.focus(); e.preventDefault();
+    });
+  }
+  $('ctrl').addEventListener('click', function () { setCtrl(!ctrl); inp.focus(); });
+  $('kbd').addEventListener('click', function () {
+    var w = $('wrap'); w.className = w.className ? '' : 'kb'; $('inrow').className = w.className;
+    setTimeout(refit, 50); inp.focus();
+  });
+  function font(d) {
+    fontSize = Math.max(10, Math.min(30, fontSize + d));
+    term.setOption('fontSize', fontSize);
+    try { localStorage.setItem('fs', fontSize); } catch (e) {}
+    setTimeout(refit, 50);
+  }
+  $('fs-').addEventListener('click', function () { font(-2); });
+  $('fs+').addEventListener('click', function () { font(2); });
+  window.addEventListener('resize', function () { setTimeout(refit, 100); });
+  window.addEventListener('orientationchange', function () { setTimeout(refit, 300); });
+
+  connect();
+})();
+</script>
+</body>
+</html>

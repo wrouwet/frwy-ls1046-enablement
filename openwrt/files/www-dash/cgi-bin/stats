@@ -1,0 +1,76 @@
+#!/usr/bin/ucode
+'use strict';
+import * as fs from 'fs';
+import * as ubus from 'ubus';
+
+function rd(p) { let s = fs.readfile(p); return s ? trim(s) : null; }
+function sh(cmd) { let p = fs.popen(cmd); if (!p) return ''; let s = p.read('all'); p.close(); return s || ''; }
+
+let u = ubus.connect();
+let out = { t: time() };
+
+try {
+	let si = u.call('system', 'info');
+	let sb = u.call('system', 'board');
+	out.host = sb.hostname; out.model = sb.model; out.kernel = sb.kernel;
+	out.release = sb.release ? sb.release.description : null;
+	out.uptime = si.uptime;
+	out.load = map(si.load, (l) => l / 65536.0);
+	out.mem = { total: si.memory.total, avail: si.memory.available };
+	out.disk = { total: si.root.total * 1024, used: si.root.used * 1024 };
+} catch (e) {}
+
+out.temps = [];
+for (let z in fs.glob('/sys/class/thermal/thermal_zone*')) {
+	let v = rd(z + '/temp');
+	if (v) push(out.temps, { name: replace(rd(z + '/type') || '', '-thermal', ''), c: +v / 1000.0 });
+}
+
+out.ifaces = {};
+for (let i in ['phy0-sta0', 'br-lan', 'phy0-ap0', 'tailscale0']) {
+	let b = '/sys/class/net/' + i;
+	if (!fs.stat(b)) continue;
+	out.ifaces[i] = {
+		up: rd(b + '/operstate') != 'down',
+		rx: +rd(b + '/statistics/rx_bytes'),
+		tx: +rd(b + '/statistics/tx_bytes')
+	};
+}
+
+try {
+	let w = u.call('iwinfo', 'info', { device: 'phy0-sta0' });
+	out.wifi = { ssid: w.ssid, signal: w.signal, quality: w.quality, qmax: w.quality_max, ch: w.channel };
+} catch (e) {}
+try {
+	let a = u.call('iwinfo', 'assoclist', { device: 'phy0-ap0' });
+	out.apClients = length(a.results);
+} catch (e) {}
+
+out.leases = [];
+let lf = fs.readfile('/tmp/dhcp.leases') || '';
+for (let l in split(lf, '\n')) {
+	let f = split(l, ' ');
+	if (length(f) >= 4) push(out.leases, { exp: +f[0], ip: f[2], name: f[3] == '*' ? f[1] : f[3] });
+}
+
+let pg = match(sh('ping -c1 -W1 1.1.1.1 2>/dev/null'), /time=([0-9.]+)/);
+out.ping = pg ? +pg[1] : null;
+
+try {
+	let ts = json(sh('tailscale status --json 2>/dev/null'));
+	let peers = [];
+	for (let k, p in ts.Peer || {})
+		push(peers, { name: p.HostName, os: p.OS, online: !!p.Online });
+	out.tailscale = { state: ts.BackendState, ip: ts.TailscaleIPs ? ts.TailscaleIPs[0] : null,
+		exitNode: !!(ts.Self && ts.Self.ExitNodeOption), peers: peers };
+} catch (e) {}
+
+let cl = split(split(fs.readfile('/proc/stat') || '', '\n')[0], /\s+/);
+let tot = 0;
+for (let i = 1; i < length(cl); i++) tot += +cl[i];
+out.cpu = { total: tot, idle: +cl[4] + +cl[5] };
+
+out.proxy = { pub: rd('/tmp/public_ip'), upnp: rd('/tmp/proxy_upnp'), port: rd('/var/run/proxyport') };
+try { let c = require('uci').cursor(); out.proxy.port = c.get('squid', 'squid', 'http_port'); } catch (e) {}
+print('Content-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n');
+print(sprintf('%J', out));
