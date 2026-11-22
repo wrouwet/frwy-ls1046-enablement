@@ -29,7 +29,7 @@ func main() {
 	leases := flag.String("leases", "/tmp/dhcp.leases", "dnsmasq leases file")
 	names := flag.String("names", "", "optional JSON with user-given device names {mac:{name}}")
 	minConf := flag.Float64("min-conf", 0.55, "minimum model confidence to report a prediction")
-	retrain := flag.Duration("retrain", 30*time.Minute, "minimum time between retrainings")
+	retrain := flag.Duration("retrain", 15*time.Minute, "minimum time between full retrainings (the network also learns online every minute)")
 	tz := flag.String("tz", "", "time zone for daily totals (e.g. America/Chicago)")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -81,6 +81,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	tick := time.NewTicker(5 * time.Second)
 	hosts := time.NewTicker(30 * time.Second)
+	online := time.NewTicker(time.Minute)
 	save := time.NewTicker(5 * time.Minute)
 	e.MaybeTrain(false)
 	for {
@@ -92,6 +93,8 @@ func main() {
 		case <-hosts.C:
 			e.RefreshHosts()
 			e.MaybeTrain(false)
+		case <-online.C:
+			e.OnlineStep()
 		case <-save.C:
 			e.SaveState()
 		case <-sig:

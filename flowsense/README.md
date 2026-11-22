@@ -24,21 +24,33 @@ br-lan ──AF_PACKET──► flow table ──► names?  (TLS SNI · QUIC SN
 
 1. **Capture** – raw `AF_PACKET` socket on the LAN bridge; IPv4 TCP/UDP headers
    decoded in user space. GRO super-packets are split into estimated wire packets.
-2. **Flow features (59)** – modelled on the *PPI* representation of the CESNET
-   datasets: signed payload sizes of the first 30 data packets, PPI duration and
-   round-trips, per-direction size statistics, inter-packet-time statistics, an
-   8-bin size histogram, byte/packet ratios, protocol and port flags
-   (`internal/flow`).
+2. **Flow features (71)** – modelled on the *PPI* representation of the CESNET
+   datasets and computed **only from the packets seen so far**: signed payload
+   sizes of the first 30 data packets, PPI duration and round-trips,
+   per-direction size statistics, inter-packet-time statistics, an 8-bin size
+   histogram, the first five sizes in each direction, burst statistics and
+   direction ratios (`internal/flow`). Flows are classified at 8, 15 and 30
+   packets, and training samples are taken at exactly the same points (the seed
+   data is augmented with the same prefixes), so the model never sees a
+   different kind of input live than in training — a test enforces this.
 3. **Self-labelling** – most flows still reveal a name: the TLS ClientHello SNI,
    the QUIC Initial SNI (decrypted with the public RFC 9001 initial keys and
    reassembled across packets), the DNS answer that resolved the server, an HTTP
-   Host header or a proxy CONNECT target. Those flows become labelled training
-   samples from *your* network (`internal/label`).
-4. **Model** – a dependency-free random forest (CART, Gini, bootstrap,
-   random feature subspaces, quantile split candidates) trained on a seed set
-   from public data plus local samples; retrained every 30 min once 200 new local
-   samples exist. Held-out accuracy, per-class F1 and live agreement (model vs.
-   visible names on your traffic) are reported by the API (`internal/ml`).
+   Host header or a proxy CONNECT target. Only the certain ones (SNI, Host,
+   CONNECT) become training labels; DNS-derived names on shared CDN addresses
+   are used for display but not for training (`internal/label`).
+4. **Two models, trained on the router**
+   * a dependency-free **random forest** (CART, Gini, bootstrap, random feature
+     subspaces, quantile split candidates), retrained every 15 min once 100 new
+     local samples exist;
+   * a small **neural network** (MLP 71→64→32→classes, Adam) that learns
+     **continuously**: every minute it takes gradient steps on the newly
+     labelled flows mixed with class-balanced replay from the sample pool, so it
+     adapts to the home network without forgetting;
+   * an **ensemble** whose mixing weight is picked on the hold-out split at each
+     retrain and then shifted by each model's live agreement.
+   Local samples are weighted 3× and evaluated separately ("your test"), and
+   the learning curve is kept in `/etc/flowsense/history.json` (`internal/ml`).
 5. **API** – `127.0.0.1:8091/api/{now,today,flows,model,all}`; JSON with the
    top running apps, per-device usage, 24 h history and model statistics. The
    API deliberately exposes activities and apps, not domains or addresses.
@@ -50,21 +62,31 @@ The seed set is built from the **CESNET-TLS22** and **CESNET-QUIC22** datasets
 flowsense apps and capped per class (`tools/export_cesnet.py`, `cmd/seedgen`,
 which computes features with the same Go code the router runs).
 
-Hold-out result of the seed model (80/20 split, 97 459 flows, 29 classes, 60 trees):
+Hold-out result on the seed data (80/20 split, 139 826 prefix samples from
+150 962 flows, 29 classes; each flow judged at 8, 15 and 30 packets):
 
-| | |
+| model | accuracy |
 |---|---|
-| accuracy | **0.931** |
-| ≥ 0.98 F1 | Instagram, YouTube, Snapchat, X, TikTok, Twitch, Xbox Live, Apple |
-| 0.90–0.97 | Facebook, Spotify, Prime Video, Netflix, Mobile games, Discord, Valorant/Riot, WhatsApp, Ads |
-| weakest | Steam 0.82, generic Web browsing 0.73 |
+| random forest (60 trees) | **0.928** |
+| neural network | 0.804 |
+| ensemble (weight picked on hold-out) | 0.928 (network weight 0 on public data) |
+
+Per app (forest F1): Instagram 0.99, X 0.98, YouTube 0.97–0.98, Xbox Live 0.98,
+Spotify 0.97, Discord 0.93–0.94, Valorant/Riot 0.95, Steam 0.87, adult sites
+0.83–0.84, generic web browsing 0.74–0.75. On public data the network adds
+nothing over the forest; its job is to adapt online to the home network, and
+the ensemble weight moves towards it only if its live agreement is better.
 
 The most important features are the sizes of the first data packets
 (ClientHello and first server records) — consistent with early-classification
 literature. **Caveat:** the split is from the same network and week; accuracy on
 a different network and later time is lower (the papers below document this
 drift), which is why flowsense keeps learning from locally labelled flows and
-shows its live agreement rather than only the offline number.
+shows its live agreement rather than only the offline number. The first
+deployment (complete-flow features, no local data) agreed with visible names on
+only 18 % of live flows — mostly because Roblox and Fortnite were missing from
+the public data and early-flow features differed from training; this version
+fixes both causes.
 
 Training on the LS1046A: ~2 minutes for ~100k samples; resident memory
 ≈ 150 MB.

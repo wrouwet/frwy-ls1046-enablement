@@ -4,6 +4,7 @@
 'use strict';
 import * as fs from 'fs';
 import * as ubus from 'ubus';
+function round(x) { return x == null ? null : int(x < 0 ? x - 0.5 : x + 0.5); }   // ucode has no round()
 
 const RUN = '/tmp/dash', PER = '/etc/dash', MAXH = 1440;
 fs.mkdir(RUN); fs.mkdir(PER);
@@ -49,7 +50,7 @@ let online = inet.loss < 100;
 if (st.online == null) st.online = online;
 if (online != st.online) {
 	if (!online) { st.downSince = now; ev('bad', gw.loss < 100 ? 'Internet down (landlord router reachable)' : 'Internet down (uplink Wi-Fi/router unreachable)'); }
-	else { let m = st.downSince ? round((now - st.downSince) / 60) : 0; ev('good', sprintf('Internet back after %d min', m)); st.downSince = null; }
+	else { let m = st.downSince ? round((now - st.downSince) / 60.0) : 0; ev('good', sprintf('Internet back after %d min', m)); st.downSince = null; }
 	st.online = online;
 }
 
@@ -57,14 +58,14 @@ if (online != st.online) {
 let cl = split(split(fs.readfile('/proc/stat') || '', '\n')[0], /\s+/);
 let tot = 0; for (let i = 1; i < length(cl); i++) tot += +cl[i];
 let idle = +cl[4] + +cl[5], cpu = null;
-if (st.cpuPrev && tot > st.cpuPrev[0]) cpu = round(100 * (1 - (idle - st.cpuPrev[1]) / (tot - st.cpuPrev[0])));
+if (st.cpuPrev && tot > st.cpuPrev[0]) cpu = round(100.0 * (1 - (idle - st.cpuPrev[1]) / (1.0 * (tot - st.cpuPrev[0]))));
 st.cpuPrev = [tot, idle];
 
 let mem = null;
-try { let si = u.call('system', 'info'); mem = round(100 * (si.memory.total - si.memory.available) / si.memory.total); } catch (e) {}
+try { let si = u.call('system', 'info'); mem = round(100.0 * (si.memory.total - si.memory.available) / si.memory.total); } catch (e) {}
 
 let tmax = null;
-for (let z in fs.glob('/sys/class/thermal/thermal_zone*')) { let v = +rd(z + '/temp') / 1000; if (tmax == null || v > tmax) tmax = v; }
+for (let z in fs.glob('/sys/class/thermal/thermal_zone*')) { let v = +rd(z + '/temp') / 1000.0; if (tmax == null || v > tmax) tmax = v; }
 if (tmax != null) {
 	if (tmax >= 85 && !st.hot) { ev('bad', sprintf('Router is hot: %d °C', tmax)); st.hot = true; }
 	else if (tmax < 80 && st.hot) { ev('good', sprintf('Router cooled down: %d °C', tmax)); st.hot = false; }
@@ -73,7 +74,7 @@ if (tmax != null) {
 let rx = +rd('/sys/class/net/phy0-sta0/statistics/rx_bytes'), tx = +rd('/sys/class/net/phy0-sta0/statistics/tx_bytes');
 let rxr = null, txr = null;
 if (st.wanPrev && now > st.wanPrev[0] && rx >= st.wanPrev[1]) {
-	rxr = round((rx - st.wanPrev[1]) / (now - st.wanPrev[0])); txr = round((tx - st.wanPrev[2]) / (now - st.wanPrev[0]));
+	rxr = round((rx - st.wanPrev[1]) / (1.0 * (now - st.wanPrev[0]))); txr = round((tx - st.wanPrev[2]) / (1.0 * (now - st.wanPrev[0])));
 }
 st.wanPrev = [now, rx, tx];
 

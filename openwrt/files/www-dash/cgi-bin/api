@@ -113,6 +113,9 @@ function live() {
 	for (let e in evs) if (e.t > ack && e.level != 'good') push(unack, e);
 	out.alerts = unack;
 	out.speedtest = fs.stat(RUN + '/speedtest.running') ? rd(RUN + '/speedtest.running') : null;
+	out.wired_off = !!fs.stat(PER + '/wired_off');
+	out.wired_ports = [];
+	for (let w in ['eth0', 'eth1', 'eth2', 'eth3']) push(out.wired_ports, { port: w, link: rd('/sys/class/net/' + w + '/carrier') == '1' });
 	out.trusted = trusted();
 	return out;
 }
@@ -153,7 +156,7 @@ function action() {
 	let len = +(getenv('CONTENT_LENGTH') || 0);
 	let p = parse(len > 0 && len < 4096 ? fs.stdin.read(len) : '');
 	let mac = lc(p.mac || '');
-	if (p.a != 'speedtest' && p.a != 'ack' && !match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)) reply({ ok: false, error: 'bad mac' }, '400 Bad Request');
+	if (p.a != 'speedtest' && p.a != 'ack' && p.a != 'wired' && !match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)) reply({ ok: false, error: 'bad mac' }, '400 Bad Request');
 	let devdb = rj(PER + '/devices.json', {});
 	if (p.a == 'rename' || p.a == 'known' || p.a == 'forget') {
 		let d = devdb[mac] || (devdb[mac] = { first: time(), last: 0 });
@@ -178,6 +181,17 @@ function action() {
 		}
 		let evs = rj(PER + '/events.json', []);
 		push(evs, { t: time(), level: 'warn', text: (p.a == 'block' ? 'Internet blocked for ' : 'Internet unblocked for ') + ((devdb[mac] && (devdb[mac].name || devdb[mac].lname)) || mac) });
+		wj(PER + '/events.json', slice(evs, -150));
+	} else if (p.a == 'wired') {
+		// on/off switch for internet on the wired ports (state survives reboots)
+		let off = p.on == '0';
+		system('nft delete table bridge dashwired 2>/dev/null');
+		if (off) {
+			system('nft -f /usr/share/dash/wired-off.nft');
+			fs.writefile(PER + '/wired_off', '' + time());
+		} else fs.unlink(PER + '/wired_off');
+		let evs = rj(PER + '/events.json', []);
+		push(evs, { t: time(), level: 'warn', text: off ? 'Internet switched OFF for wired devices' : 'Internet switched ON for wired devices' });
 		wj(PER + '/events.json', slice(evs, -150));
 	} else if (p.a == 'speedtest') {
 		system('/usr/bin/ucode /usr/share/dash/speedtest.uc >/dev/null 2>&1 &');
