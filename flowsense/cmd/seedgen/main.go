@@ -25,7 +25,7 @@ func main() {
 	out := flag.String("out", "seed.csv.gz", "feature CSV for the router")
 	modelOut := flag.String("model", "", "also write a trained model JSON here")
 	evalOut := flag.String("eval", "", "write evaluation JSON here")
-	per := flag.Int("per-class", 4000, "max samples per class")
+	per := flag.Int("per-class", 6000, "max samples per class")
 	trees := flag.Int("trees", 60, "trees")
 	flag.Parse()
 
@@ -57,8 +57,7 @@ func main() {
 			log.Fatal(err)
 		}
 		f := func(k string) float64 { v, _ := strconv.ParseFloat(rec[col[k]], 64); return v }
-		pin := flow.PPIInput{Bytes: f("bytes"), BytesRev: f("bytes_rev"), Packets: f("packets"), PacketsRev: f("packets_rev"),
-			UDP: rec[col["udp"]] == "1", Port443: true}
+		pin := flow.PPIInput{UDP: rec[col["udp"]] == "1", Port443: true}
 		for i := 1; i <= flow.PPILen; i++ {
 			s := int(f("s" + strconv.Itoa(i)))
 			if s == 0 {
@@ -70,7 +69,16 @@ func main() {
 		if len(pin.Size) < 2 {
 			continue
 		}
-		ds.Add(ml.Sample{X: flow.Compute(pin), Label: rec[col["app"]], Source: "seed"})
+		// one sample per classification point the router uses (8, 15, 30 packets)
+		for _, k := range flow.Horizons {
+			if k > len(pin.Size) && k != flow.Horizons[0] {
+				break
+			}
+			ds.Add(ml.Sample{X: flow.Compute(pin.Prefix(k)), Label: rec[col["app"]], Source: "seed"})
+			if k >= len(pin.Size) {
+				break
+			}
+		}
 		n++
 	}
 	samples := ds.Snapshot(1)
@@ -98,17 +106,18 @@ func main() {
 	p := ml.DefaultParams(len(flow.FeatureNames))
 	p.Trees = *trees
 	t0 := time.Now()
-	model, ev := ml.TrainEval(samples, flow.FeatureNames, p, *modelOut != "")
-	log.Printf("trained in %s: hold-out accuracy %.3f on %d flows", time.Since(t0).Round(time.Second), ev.Accuracy, ev.N)
+	res := ml.TrainBoth(samples, flow.FeatureNames, p, 3)
+	model, ev := res.Forest, res.EvalRF
+	log.Printf("trained in %s: hold-out accuracy forest %.3f, network %.3f, ensemble %.3f (network weight %.1f) on %d samples",
+		time.Since(t0).Round(time.Second), res.EvalRF.Accuracy, res.EvalNet.Accuracy, res.EvalEns.Accuracy, res.NetW, ev.N)
 	var names []string
 	for c := range ev.PerClass {
 		names = append(names, c)
 	}
-	sort.Slice(names, func(i, j int) bool { return ev.PerClass[names[i]].F1 > ev.PerClass[names[j]].F1 })
-	fmt.Printf("%-26s %6s %6s %6s %6s\n", "class", "prec", "recall", "F1", "n")
+	sort.Slice(names, func(i, j int) bool { return res.EvalEns.PerClass[names[i]].F1 > res.EvalEns.PerClass[names[j]].F1 })
+	fmt.Printf("%-26s %7s %7s %7s %6s\n", "class", "F1 rf", "F1 net", "F1 ens", "n")
 	for _, c := range names {
-		m := ev.PerClass[c]
-		fmt.Printf("%-26s %6.2f %6.2f %6.2f %6d\n", c, m.Precision, m.Recall, m.F1, m.Support)
+		fmt.Printf("%-26s %7.2f %7.2f %7.2f %6d\n", c, res.EvalRF.PerClass[c].F1, res.EvalNet.PerClass[c].F1, res.EvalEns.PerClass[c].F1, ev.PerClass[c].Support)
 	}
 	type fi struct {
 		Name string

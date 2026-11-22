@@ -11,7 +11,7 @@ set -e
 PROXY_PORT=${PROXY_PORT:-38129}
 LAN_IP=${LAN_IP:-192.168.50.1}
 
-apk add squid miniupnpc conntrack >/dev/null
+apk add squid miniupnpc conntrack kmod-nft-bridge >/dev/null
 
 # --- dashboard web server (plain HTTP, separate from LuCI) ---
 uci -q delete uhttpd.dash || true

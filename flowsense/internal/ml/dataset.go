@@ -89,10 +89,12 @@ func (d *Dataset) Snapshot(minPerClass int) []Sample {
 
 // Eval is a held-out evaluation of a model.
 type Eval struct {
-	Accuracy  float64                   `json:"accuracy"`
-	N         int                       `json:"n"`
-	PerClass  map[string]ClassMetrics   `json:"per_class"`
-	Confusion map[string]map[string]int `json:"confusion"`
+	Accuracy      float64                   `json:"accuracy"`
+	N             int                       `json:"n"`
+	LocalAccuracy float64                   `json:"local_accuracy"`
+	LocalN        int                       `json:"local_n"`
+	PerClass      map[string]ClassMetrics   `json:"per_class"`
+	Confusion     map[string]map[string]int `json:"confusion"`
 }
 
 // ClassMetrics are precision/recall/F1 for one class.
@@ -202,10 +204,10 @@ func LoadCSV(path string, nFeat int, d *Dataset) (int, error) {
 		if err != nil {
 			return n, err
 		}
+		if rec[0] == "label" && rec[1] == "source" {
+			continue // header
+		}
 		if len(rec) != nFeat+2 {
-			if n == 0 && rec[0] == "label" {
-				continue // header
-			}
 			return n, fmt.Errorf("row %d: %d fields, want %d", n, len(rec), nFeat+2)
 		}
 		x := make([]float32, nFeat)
@@ -251,4 +253,175 @@ func (d *Dataset) SaveLocalCSV(path string) error {
 	gz.Close()
 	fh.Close()
 	return os.Rename(tmp, path)
+}
+
+// Random returns up to n random samples (replay buffer for online learning).
+func (d *Dataset) Random(n int, rng *rand.Rand) []Sample {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var keys []string
+	for k, l := range d.byClass {
+		if len(l) > 0 {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]Sample, 0, n)
+	for i := 0; i < n; i++ { // class-balanced replay
+		l := d.byClass[keys[rng.Intn(len(keys))]]
+		out = append(out, l[rng.Intn(len(l))])
+	}
+	return out
+}
+
+// BothResult is the outcome of training the forest and the network together.
+type BothResult struct {
+	Forest  *Forest
+	Net     *MLP
+	EvalRF  Eval
+	EvalNet Eval
+	EvalEns Eval
+	NetW    float64 // ensemble weight of the network, chosen on the hold-out split
+	TrainN  int
+	LocalN  int
+}
+
+// TrainBoth splits samples 80/20, trains a random forest and an MLP on the
+// training part (local samples weighted localWeight×), evaluates the forest,
+// the network and their average on the test part (overall and local-only),
+// then refits both on all samples for deployment.
+func TrainBoth(samples []Sample, features []string, p Params, localWeight int) BothResult {
+	rng := rand.New(rand.NewSource(p.Seed))
+	rng.Shuffle(len(samples), func(i, j int) { samples[i], samples[j] = samples[j], samples[i] })
+	classSet := map[string]bool{}
+	for _, s := range samples {
+		classSet[s.Label] = true
+	}
+	var classes []string
+	for c := range classSet {
+		classes = append(classes, c)
+	}
+	sort.Strings(classes)
+	ci := map[string]int{}
+	for i, c := range classes {
+		ci[c] = i
+	}
+	weighted := func(s []Sample) ([]Sample, []float64) {
+		var out []Sample
+		var w []float64
+		for _, x := range s {
+			k := 1
+			if x.Source == "local" {
+				k = localWeight
+			}
+			for i := 0; i < k; i++ {
+				out = append(out, x)
+			}
+			w = append(w, float64(k))
+		}
+		return out, w
+	}
+	split := len(samples) * 4 / 5
+	train, test := samples[:split], samples[split:]
+	tw, _ := weighted(train)
+	X, y := toXY(tw, ci)
+	rf := Train(X, y, classes, features, p)
+	net := NewMLP(train, classes, []int{64, 32}, p.Seed)
+	_, w := weighted(train)
+	net.Fit(train, w, 12, 64, 2e-3, p.Seed)
+	res := BothResult{TrainN: len(samples)}
+	for _, s := range samples {
+		if s.Source == "local" {
+			res.LocalN++
+		}
+	}
+	res.EvalRF = evaluate(test, classes, func(x []float32) []float64 { return rf.Predict(x) })
+	res.EvalNet = evaluate(test, classes, func(x []float32) []float64 { return net.Predict(x) })
+	// choose the mixing weight on the hold-out split (0 = forest only)
+	pf, pn := make([][]float64, len(test)), make([][]float64, len(test))
+	for i, s := range test {
+		pf[i], pn[i] = rf.Predict(s.X), net.Predict(s.X)
+	}
+	best := -1.0
+	for _, w := range []float64{0, 0.1, 0.2, 0.3, 0.4, 0.5} {
+		k := 0
+		ev := evaluate(test, classes, func(x []float32) []float64 {
+			a := make([]float64, len(pf[k]))
+			for i := range a {
+				a[i] = (1-w)*pf[k][i] + w*pn[k][i]
+			}
+			k++
+			return a
+		})
+		if ev.Accuracy > best+0.002 || (w > 0 && ev.Accuracy >= best && res.NetW == 0) {
+			best, res.NetW, res.EvalEns = ev.Accuracy, w, ev
+		}
+	}
+	// deploy: refit the forest on everything, give the network one more pass
+	all, aw := weighted(samples)
+	X, y = toXY(all, ci)
+	res.Forest = Train(X, y, classes, features, p)
+	_ = aw
+	_, w2 := weighted(samples)
+	net.Fit(samples, w2, 2, 64, 1e-3, p.Seed+1)
+	res.Net = net
+	return res
+}
+
+func evaluate(test []Sample, classes []string, pred func([]float32) []float64) Eval {
+	ev := Eval{PerClass: map[string]ClassMetrics{}, Confusion: map[string]map[string]int{}}
+	tp, fp, fn, sup := map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}
+	correct, lc, ln := 0, 0, 0
+	for _, s := range test {
+		p := pred(s.X)
+		bi := 0
+		for i := range p {
+			if p[i] > p[bi] {
+				bi = i
+			}
+		}
+		pc := classes[bi]
+		if ev.Confusion[s.Label] == nil {
+			ev.Confusion[s.Label] = map[string]int{}
+		}
+		ev.Confusion[s.Label][pc]++
+		sup[s.Label]++
+		if s.Source == "local" {
+			ln++
+		}
+		if pc == s.Label {
+			correct++
+			tp[s.Label]++
+			if s.Source == "local" {
+				lc++
+			}
+		} else {
+			fp[pc]++
+			fn[s.Label]++
+		}
+	}
+	ev.N = len(test)
+	if ev.N > 0 {
+		ev.Accuracy = float64(correct) / float64(ev.N)
+	}
+	ev.LocalN = ln
+	if ln > 0 {
+		ev.LocalAccuracy = float64(lc) / float64(ln)
+	}
+	for _, c := range classes {
+		m := ClassMetrics{Support: sup[c]}
+		if tp[c]+fp[c] > 0 {
+			m.Precision = float64(tp[c]) / float64(tp[c]+fp[c])
+		}
+		if tp[c]+fn[c] > 0 {
+			m.Recall = float64(tp[c]) / float64(tp[c]+fn[c])
+		}
+		if m.Precision+m.Recall > 0 {
+			m.F1 = 2 * m.Precision * m.Recall / (m.Precision + m.Recall)
+		}
+		ev.PerClass[c] = m
+	}
+	return ev
 }

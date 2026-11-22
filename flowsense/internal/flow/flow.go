@@ -20,6 +20,10 @@ import (
 // PPILen is the number of payload packets kept per flow.
 const PPILen = 30
 
+// Horizons are the PPI lengths at which flows are classified and sampled for
+// training (the seed data is augmented with the same prefixes).
+var Horizons = []int{8, 15, 30}
+
 // Key identifies a flow from the local client's point of view.
 type Key struct {
 	Proto  uint8
@@ -78,6 +82,8 @@ type Flow struct {
 	How              string // "name", "model", "rule"
 	LabelCat         string // category derived from the name (training label)
 	LastClassifiedAt int    // nPPI at last classification
+	Sampled          uint8  // bitmask of horizons already used as training samples
+	Strong           bool   // label comes from SNI/Host (not a DNS guess)
 }
 
 // Add updates the flow with a packet; up = client -> server.
@@ -135,8 +141,10 @@ func (f *Flow) Add(p *capture.Packet, up bool) {
 // PPICount returns how many payload packets are in the PPI.
 func (f *Flow) PPICount() int { return f.nPPI }
 
-// FeatureNames lists the model inputs in order (must match Features and the
-// CESNET converter in tools/).
+// FeatureNames lists the model inputs in order (must match Compute).
+// Every feature is computed from the PPI prefix alone (no whole-flow
+// counters), so a flow looks the same to the model whether it is 8 packets
+// old or finished; training uses prefixes of 8, 15 and 30 packets.
 var FeatureNames = func() []string {
 	var n []string
 	for i := 1; i <= PPILen; i++ {
@@ -148,7 +156,14 @@ var FeatureNames = func() []string {
 	for i := 1; i <= 8; i++ {
 		n = append(n, "ppi_hist_"+itoa(i))
 	}
-	n = append(n, "ratio_bytes_rev", "ratio_pkts_rev", "avg_pkt_up", "avg_pkt_down", "is_udp", "port_443")
+	for i := 1; i <= 5; i++ {
+		n = append(n, "up_size_"+itoa(i))
+	}
+	for i := 1; i <= 5; i++ {
+		n = append(n, "down_size_"+itoa(i))
+	}
+	n = append(n, "bursts", "burst_bytes_mean", "burst_bytes_max", "burst_pkts_mean",
+		"down_up_bytes", "down_up_pkts", "is_udp", "port_443")
 	return n
 }()
 
@@ -162,12 +177,10 @@ func itoa(i int) string {
 // PPIInput is the raw material for feature computation; it is shared with the
 // CESNET converter so both produce identical vectors.
 type PPIInput struct {
-	Size                []int     // signed payload sizes
-	IPT                 []float64 // ms, first = 0
-	Bytes, BytesRev     float64
-	Packets, PacketsRev float64
-	UDP                 bool
-	Port443             bool
+	Size    []int     // signed payload sizes
+	IPT     []float64 // ms, first = 0
+	UDP     bool
+	Port443 bool
 }
 
 func histBin(s int) int {
@@ -241,6 +254,57 @@ func Compute(in PPIInput) []float32 {
 			v = append(v, 0)
 		}
 	}
+	// first five sizes in each direction (handshake shape)
+	var fu, fd []float32
+	for i := 0; i < n; i++ {
+		if in.Size[i] >= 0 && len(fu) < 5 {
+			fu = append(fu, float32(in.Size[i]))
+		} else if in.Size[i] < 0 && len(fd) < 5 {
+			fd = append(fd, float32(-in.Size[i]))
+		}
+	}
+	for len(fu) < 5 {
+		fu = append(fu, 0)
+	}
+	for len(fd) < 5 {
+		fd = append(fd, 0)
+	}
+	v = append(v, fu...)
+	v = append(v, fd...)
+	// bursts: maximal runs of packets in one direction
+	var bursts, bmax, bbytes, bpk, curB, curP float64
+	for i := 0; i < n; i++ {
+		a := in.Size[i]
+		if a < 0 {
+			a = -a
+		}
+		if i > 0 && (in.Size[i] >= 0) != (in.Size[i-1] >= 0) {
+			bursts++
+			bbytes += curB
+			bpk += curP
+			if curB > bmax {
+				bmax = curB
+			}
+			curB, curP = 0, 0
+		}
+		curB += float64(a)
+		curP++
+	}
+	if n > 0 {
+		bursts++
+		bbytes += curB
+		bpk += curP
+		if curB > bmax {
+			bmax = curB
+		}
+	}
+	var upB, dnB float64
+	for _, x := range up {
+		upB += x
+	}
+	for _, x := range dn {
+		dnB += x
+	}
 	udp, p443 := float32(0), float32(0)
 	if in.UDP {
 		udp = 1
@@ -248,9 +312,19 @@ func Compute(in PPIInput) []float32 {
 	if in.Port443 {
 		p443 = 1
 	}
-	v = append(v, float32(ratio(in.BytesRev, in.Bytes)), float32(ratio(in.PacketsRev, in.Packets)),
-		float32(ratio(in.Bytes, in.Packets)), float32(ratio(in.BytesRev, in.PacketsRev)), udp, p443)
+	v = append(v, float32(bursts), float32(ratio(bbytes, bursts)), float32(bmax), float32(ratio(bpk, bursts)),
+		float32(ratio(dnB, upB)), float32(ratio(float64(len(dn)), float64(len(up)))), udp, p443)
 	return v
+}
+
+// Prefix returns a copy of in truncated to the first k PPI packets.
+func (in PPIInput) Prefix(k int) PPIInput {
+	if k >= len(in.Size) {
+		return in
+	}
+	out := in
+	out.Size, out.IPT = in.Size[:k], in.IPT[:k]
+	return out
 }
 
 func stats(a []float64) (mean, std, mx float64) {
@@ -289,12 +363,23 @@ func ratio(a, b float64) float64 {
 	return a / b
 }
 
+// FeaturesAt returns the feature vector of the first k PPI packets.
+func (f *Flow) FeaturesAt(k int) []float32 {
+	if k > f.nPPI {
+		k = f.nPPI
+	}
+	in := PPIInput{Size: make([]int, k), IPT: make([]float64, k), UDP: f.Key.Proto == 17, Port443: f.Key.SPort == 443}
+	for i := 0; i < k; i++ {
+		in.Size[i] = int(f.ppiSize[i])
+		in.IPT[i] = float64(f.ppiIPT[i])
+	}
+	return Compute(in)
+}
+
 // Features returns the feature vector for the flow so far.
 func (f *Flow) Features() []float32 {
 	in := PPIInput{
 		Size: make([]int, f.nPPI), IPT: make([]float64, f.nPPI),
-		Bytes: float64(f.Bytes), BytesRev: float64(f.BytesRev),
-		Packets: float64(f.Packets), PacketsRev: float64(f.PacketsRev),
 		UDP: f.Key.Proto == 17, Port443: f.Key.SPort == 443,
 	}
 	for i := 0; i < f.nPPI; i++ {

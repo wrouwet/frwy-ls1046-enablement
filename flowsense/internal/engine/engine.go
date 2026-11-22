@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"math"
+	"math/rand"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -52,11 +53,21 @@ type Engine struct {
 
 	ds        *ml.Dataset
 	model     atomic.Pointer[ml.Forest]
+	net       atomic.Pointer[ml.MLP]
 	training  atomic.Bool
 	evalMu    sync.Mutex
-	eval      ml.Eval
+	eval      ml.Eval // forest
+	evalNet   ml.Eval
+	evalEns   ml.Eval
 	trainedAt time.Time
 	newLocal  int
+	history   []Round
+
+	queueMu   sync.Mutex
+	queue     []ml.Sample // new local samples waiting for an online network update
+	online    atomic.Int64
+	wRF, wNet float64 // ensemble weights (from live agreement)
+	live      map[string]*liveScore
 
 	// live statistics (engine goroutine only)
 	tickRate map[string]*acct            // app -> bytes in last tick
@@ -78,6 +89,46 @@ type Engine struct {
 
 type hostInfo struct{ MAC, Name string }
 
+// liveScore tracks how often a model agrees with names seen on this network
+// (exponentially weighted so it follows the model as it learns).
+type liveScore struct {
+	Agree, Total int
+	EWMA         float64
+}
+
+func (l *liveScore) add(ok bool) {
+	l.Total++
+	x := 0.0
+	if ok {
+		l.Agree++
+		x = 1
+	}
+	if l.Total == 1 {
+		l.EWMA = x
+	} else {
+		l.EWMA = 0.98*l.EWMA + 0.02*x
+	}
+}
+
+// Round is one point of the learning curve.
+type Round struct {
+	T          int64   `json:"t"`
+	Kind       string  `json:"kind"` // "retrain" or "online"
+	Samples    int     `json:"samples"`
+	Local      int     `json:"local"`
+	Classes    int     `json:"classes"`
+	AccRF      float64 `json:"acc_rf,omitempty"`
+	AccNet     float64 `json:"acc_net,omitempty"`
+	AccEns     float64 `json:"acc_ens,omitempty"`
+	LocalAccRF float64 `json:"local_acc_rf,omitempty"`
+	LocalAccNt float64 `json:"local_acc_net,omitempty"`
+	LocalAccEn float64 `json:"local_acc_ens,omitempty"`
+	LiveRF     float64 `json:"live_rf"`
+	LiveNet    float64 `json:"live_net"`
+	LiveEns    float64 `json:"live_ens"`
+	Seconds    float64 `json:"seconds,omitempty"`
+}
+
 type histBucket struct {
 	T    int64              `json:"t"`
 	Apps map[string]float64 `json:"apps"`
@@ -87,7 +138,8 @@ type histBucket struct {
 func New(cfg Config) *Engine {
 	e := &Engine{cfg: cfg, flows: map[flow.Key]*flow.Flow{}, dns: map[netip.Addr]dnsEnt{}, clhbuf: map[flow.Key][]byte{},
 		ds: ml.NewDataset(4000), tickRate: map[string]*acct{}, tickCli: map[string]map[string]*acct{},
-		today: map[string]*acct{}, todayCli: map[string]map[string]float64{}, agree: map[string][2]int{}, hosts: map[netip.Addr]hostInfo{}}
+		today: map[string]*acct{}, todayCli: map[string]map[string]float64{}, agree: map[string][2]int{}, hosts: map[netip.Addr]hostInfo{},
+		wRF: 0.8, wNet: 0.2, live: map[string]*liveScore{"rf": {}, "net": {}, "ens": {}}}
 	os.MkdirAll(cfg.DataDir, 0755)
 	if cfg.SeedCSV != "" {
 		if n, err := ml.LoadCSV(cfg.SeedCSV, len(flow.FeatureNames), e.ds); err != nil {
@@ -108,6 +160,13 @@ func New(cfg Config) *Engine {
 			e.trainedAt = st.ModTime()
 		}
 		log.Printf("model: loaded (%d classes)", len(m.Classes))
+	}
+	if n, err := ml.LoadMLP(filepath.Join(cfg.DataDir, "net.json")); err == nil && len(n.Mean) == len(flow.FeatureNames) {
+		e.net.Store(n)
+		log.Printf("network: loaded (%d steps)", n.Steps)
+	}
+	if b, err := os.ReadFile(filepath.Join(cfg.DataDir, "history.json")); err == nil {
+		json.Unmarshal(b, &e.history)
 	}
 	e.loadState()
 	e.refreshHosts()
@@ -173,8 +232,15 @@ func (e *Engine) Handle(p *capture.Packet) {
 		e.inspect(f, p)
 	}
 	n := f.PPICount()
-	if (f.Category == "" && (n >= 8 || p.TS.Sub(f.First) > 5*time.Second)) || (n == flow.PPILen && f.LastClassifiedAt < flow.PPILen) {
+	if f.Category == "" && p.TS.Sub(f.First) > 5*time.Second {
 		e.classify(f)
+		return
+	}
+	for _, h := range flow.Horizons {
+		if n >= h && f.LastClassifiedAt < h {
+			e.classify(f)
+			break
+		}
 	}
 }
 
@@ -237,31 +303,89 @@ func udpBehaviour(f *flow.Flow) string {
 	return ""
 }
 
+// predict runs the forest and the network on a feature vector and returns
+// each model's top class plus the weighted ensemble's top class/confidence.
+func (e *Engine) predict(x []float32) (rf, net, ens string, conf float64) {
+	m, n := e.model.Load(), e.net.Load()
+	if m == nil {
+		return
+	}
+	pr := m.Predict(x)
+	best := func(p []float64, cls []string) (string, float64) {
+		bi := 0
+		for i := range p {
+			if p[i] > p[bi] {
+				bi = i
+			}
+		}
+		return cls[bi], p[bi]
+	}
+	rf, _ = best(pr, m.Classes)
+	if n == nil {
+		ens, conf = best(pr, m.Classes)
+		return
+	}
+	pn := n.Predict(x)
+	net, _ = best(pn, n.Classes)
+	idx := map[string]int{}
+	for i, c := range n.Classes {
+		idx[c] = i
+	}
+	wr, wn := e.wRF, e.wNet
+	pe := make([]float64, len(pr))
+	for i, c := range m.Classes {
+		pe[i] = wr * pr[i]
+		if j, ok := idx[c]; ok {
+			pe[i] += wn * pn[j]
+		}
+		pe[i] /= wr + wn
+	}
+	ens, conf = best(pe, m.Classes)
+	return
+}
+
 func (e *Engine) classify(f *flow.Flow) {
-	f.LastClassifiedAt = f.PPICount()
+	n := f.PPICount()
+	f.LastClassifiedAt = n
 	k := f.Key
 	name, src := f.Names.Best()
 	if d, ok := e.dns[k.Server]; ok && f.Names.DNS == "" {
 		f.Names.DNS = d.name
 		name, src = f.Names.Best()
 	}
-	m := e.model.Load()
-	var pred string
+	var rf, net, ens string
 	var conf float64
-	if m != nil && f.PPICount() >= 3 && !f.Names.Proxied {
-		pred, conf = m.Best(f.Features())
+	if n >= 3 && !f.Names.Proxied {
+		rf, net, ens, conf = e.predict(f.Features())
 	}
 	if name != "" {
 		app := label.FromName(name)
-		// Discord voice servers are named; game/realtime UDP to them is voice
 		f.Category, f.How, f.Confidence, f.LabelCat = app, "name:"+src, 1, app
-		if pred != "" && f.PPICount() >= 8 {
-			a := e.agree[app]
-			a[1]++
-			if pred == app {
-				a[0]++
+		f.Strong = src == "sni" || src == "host"
+		if f.Strong && !f.Names.Proxied {
+			// training samples at the same horizons the router predicts at
+			for hi, h := range flow.Horizons {
+				if n >= h && f.Sampled&(1<<hi) == 0 {
+					f.Sampled |= 1 << hi
+					e.addLocal(ml.Sample{X: f.FeaturesAt(h), Label: app, Source: "local"})
+				}
 			}
-			e.agree[app] = a
+			// live agreement: only for apps the models know
+			if ens != "" && n >= flow.Horizons[0] {
+				if m := e.model.Load(); m != nil && contains(m.Classes, app) {
+					e.live["rf"].add(rf == app)
+					e.live["ens"].add(ens == app)
+					if net != "" {
+						e.live["net"].add(net == app)
+					}
+					a := e.agree[app]
+					a[1]++
+					if ens == app {
+						a[0]++
+					}
+					e.agree[app] = a
+				}
+			}
 		}
 		return
 	}
@@ -273,22 +397,37 @@ func (e *Engine) classify(f *flow.Flow) {
 		f.Category, f.How, f.Confidence = b, "behaviour", 0.7
 		return
 	}
-	if pred != "" && conf >= e.cfg.MinConf {
-		f.Category, f.How, f.Confidence = pred, "model", conf
-		return
-	}
-	if k.Proto == 17 && k.SPort != 443 {
-		f.Category, f.How, f.Confidence = label.AppUnknown, "none", conf
+	if ens != "" && conf >= e.cfg.MinConf {
+		f.Category, f.How, f.Confidence = ens, "model", conf
 		return
 	}
 	f.Category, f.How, f.Confidence = label.AppUnknown, "none", conf
 }
 
-// finish handles a flow that ended: training sample + cleanup.
+func contains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) addLocal(s ml.Sample) {
+	e.ds.Add(s)
+	e.newLocal++
+	e.queueMu.Lock()
+	if len(e.queue) < 5000 {
+		e.queue = append(e.queue, s)
+	}
+	e.queueMu.Unlock()
+}
+
+// finish handles a flow that ended: a training sample for short labelled
+// flows that never reached the first horizon, then cleanup.
 func (e *Engine) finish(k flow.Key, f *flow.Flow) {
-	if f.LabelCat != "" && strings.HasPrefix(f.How, "name:") && !f.Names.Proxied && f.PPICount() >= 3 {
-		e.ds.Add(ml.Sample{X: f.Features(), Label: f.LabelCat, Source: "local"})
-		e.newLocal++
+	if f.Strong && !f.Names.Proxied && f.LabelCat != "" && f.Sampled == 0 && f.PPICount() >= 4 {
+		e.addLocal(ml.Sample{X: f.Features(), Label: f.LabelCat, Source: "local"})
 	}
 	delete(e.flows, k)
 	delete(e.clhbuf, k)
@@ -552,9 +691,17 @@ func (e *Engine) publish(now time.Time, flowsPerApp map[string]int) {
 	}
 	counts, sources := e.ds.Counts()
 	e.evalMu.Lock()
-	ev := e.eval
+	ev, evN, evE := e.eval, e.evalNet, e.evalEns
 	ta := e.trainedAt
+	hist := append([]Round(nil), e.history...)
 	e.evalMu.Unlock()
+	liveOut := map[string]interface{}{}
+	for k, v := range e.live {
+		liveOut[k] = map[string]interface{}{"agree": v.Agree, "total": v.Total, "recent": math.Round(v.EWMA*1000) / 1000}
+	}
+	if n := e.net.Load(); n != nil {
+		liveOut["net_steps"] = n.Steps
+	}
 	stats := map[string]interface{}{
 		"packets": e.pkts, "active_flows": len(e.flows), "dns_cache": len(e.dns),
 		"model_loaded": e.model.Load() != nil, "training": e.training.Load(), "trained_at": ta.Unix(),
@@ -562,7 +709,12 @@ func (e *Engine) publish(now time.Time, flowsPerApp map[string]int) {
 		"samples_per_class": counts, "samples_by_source": sources, "new_local_samples": e.newLocal,
 		"live_agreement": agree, "live_agreement_total": map[string]int{"agree": ag, "labelled": at},
 		"min_confidence": e.cfg.MinConf,
-		"activities":     activities(),
+		"net_loaded":     e.net.Load() != nil,
+		"net_holdout":    evN.Accuracy, "ens_holdout": evE.Accuracy,
+		"local_holdout": map[string]float64{"rf": ev.LocalAccuracy, "net": evN.LocalAccuracy, "ens": evE.LocalAccuracy, "n": float64(ev.LocalN)},
+		"live":          liveOut, "weights": map[string]float64{"rf": e.wRF, "net": e.wNet},
+		"online_updates": e.online.Load(), "history": hist,
+		"activities": activities(),
 	}
 	if m := e.model.Load(); m != nil {
 		type fi struct {
@@ -605,13 +757,14 @@ func (e *Engine) Snap() Snapshot {
 
 // ---------------- training ----------------
 
-// MaybeTrain retrains in the background when due.
+// MaybeTrain retrains forest + network in the background when due.
 func (e *Engine) MaybeTrain(force bool) {
-	due := e.model.Load() == nil || force || (time.Since(e.trainedAt) > e.cfg.RetrainMin && e.newLocal >= 200)
+	due := e.model.Load() == nil || e.net.Load() == nil || force ||
+		(time.Since(e.trainedAt) > e.cfg.RetrainMin && e.newLocal >= 100)
 	if !due || e.training.Load() {
 		return
 	}
-	samples := e.ds.Snapshot(40)
+	samples := e.ds.Snapshot(25)
 	if len(samples) < 200 {
 		return
 	}
@@ -621,18 +774,100 @@ func (e *Engine) MaybeTrain(force bool) {
 		defer e.training.Store(false)
 		t0 := time.Now()
 		p := ml.DefaultParams(len(flow.FeatureNames))
-		m, ev := ml.TrainEval(samples, flow.FeatureNames, p, true)
-		e.model.Store(m)
+		r := ml.TrainBoth(samples, flow.FeatureNames, p, 3)
+		e.model.Store(r.Forest)
+		e.net.Store(r.Net)
+		e.queueMu.Lock()
+		e.queue = nil // already contained in this training run
+		e.queueMu.Unlock()
 		e.evalMu.Lock()
-		e.eval, e.trainedAt = ev, time.Now()
-		e.evalMu.Unlock()
+		e.eval, e.evalNet, e.evalEns, e.trainedAt = r.EvalRF, r.EvalNet, r.EvalEns, time.Now()
+		e.wRF, e.wNet = 1-r.NetW, r.NetW
 		e.newLocal -= newLocal
-		m.Save(filepath.Join(e.cfg.DataDir, "model.json"))
-		b, _ := json.Marshal(ev)
+		e.history = append(e.history, Round{T: time.Now().Unix(), Kind: "retrain", Samples: r.TrainN, Local: r.LocalN, Classes: len(r.Forest.Classes),
+			AccRF: r.EvalRF.Accuracy, AccNet: r.EvalNet.Accuracy, AccEns: r.EvalEns.Accuracy,
+			LocalAccRF: r.EvalRF.LocalAccuracy, LocalAccNt: r.EvalNet.LocalAccuracy, LocalAccEn: r.EvalEns.LocalAccuracy,
+			LiveRF: e.live["rf"].EWMA, LiveNet: e.live["net"].EWMA, LiveEns: e.live["ens"].EWMA, Seconds: time.Since(t0).Seconds()})
+		e.saveHistoryLocked()
+		e.evalMu.Unlock()
+		r.Forest.Save(filepath.Join(e.cfg.DataDir, "model.json"))
+		r.Net.Save(filepath.Join(e.cfg.DataDir, "net.json"))
+		b, _ := json.Marshal(r.EvalRF)
 		os.WriteFile(filepath.Join(e.cfg.DataDir, "eval.json"), b, 0644)
 		e.ds.SaveLocalCSV(filepath.Join(e.cfg.DataDir, "local.csv.gz"))
-		log.Printf("trained on %d samples in %s, hold-out accuracy %.3f", len(samples), time.Since(t0).Round(time.Second), ev.Accuracy)
+		log.Printf("trained on %d samples (%d local, %d classes) in %s: hold-out rf %.3f net %.3f ens %.3f | local rf %.3f net %.3f ens %.3f",
+			r.TrainN, r.LocalN, len(r.Forest.Classes), time.Since(t0).Round(time.Second), r.EvalRF.Accuracy, r.EvalNet.Accuracy, r.EvalEns.Accuracy,
+			r.EvalRF.LocalAccuracy, r.EvalNet.LocalAccuracy, r.EvalEns.LocalAccuracy)
 	}()
+}
+
+// OnlineStep updates the network with newly labelled local flows (mixed
+// with class-balanced replay from the pool) and re-weights the ensemble from
+// live agreement. Call about once a minute.
+func (e *Engine) OnlineStep() {
+	e.updateWeights()
+	n := e.net.Load()
+	if n == nil || e.training.Load() {
+		return
+	}
+	e.queueMu.Lock()
+	fresh := e.queue
+	e.queue = nil
+	e.queueMu.Unlock()
+	if len(fresh) == 0 {
+		return
+	}
+	go func() {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		c := n.Clone()
+		steps := len(fresh)/8 + 3
+		for i := 0; i < steps; i++ {
+			batch := make([]ml.Sample, 0, 48)
+			for j := 0; j < 16; j++ {
+				batch = append(batch, fresh[rng.Intn(len(fresh))])
+			}
+			batch = append(batch, e.ds.Random(32, rng)...)
+			c.Step(batch, nil, 5e-4)
+		}
+		if !e.training.Load() {
+			e.net.Store(c)
+			e.online.Add(1)
+		}
+		if e.online.Load()%10 == 0 {
+			c.Save(filepath.Join(e.cfg.DataDir, "net.json"))
+			e.evalMu.Lock()
+			e.history = append(e.history, Round{T: time.Now().Unix(), Kind: "online", Samples: len(fresh),
+				LiveRF: e.live["rf"].EWMA, LiveNet: e.live["net"].EWMA, LiveEns: e.live["ens"].EWMA})
+			e.saveHistoryLocked()
+			e.evalMu.Unlock()
+		}
+	}()
+}
+
+// updateWeights sets ensemble weights proportional to each model's recent
+// live agreement (needs some evidence before moving away from the prior).
+func (e *Engine) updateWeights() {
+	r, n := e.live["rf"], e.live["net"]
+	if r.Total < 50 || n.Total < 50 {
+		return
+	}
+	// the model that agrees more with names seen on this network gets more weight
+	d := n.EWMA - r.EWMA
+	w := e.wNet + 0.05*d
+	if w < 0 {
+		w = 0
+	} else if w > 0.7 {
+		w = 0.7
+	}
+	e.wRF, e.wNet = 1-w, w
+}
+
+func (e *Engine) saveHistoryLocked() {
+	if len(e.history) > 600 {
+		e.history = e.history[len(e.history)-600:]
+	}
+	b, _ := json.Marshal(e.history)
+	os.WriteFile(filepath.Join(e.cfg.DataDir, "history.json"), b, 0644)
 }
 
 // ---------------- hosts & persistence ----------------

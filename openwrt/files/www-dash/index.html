@@ -55,6 +55,7 @@
   .tag.b { background: #f85149; color: #fff; }
   .chips span { display: inline-block; font-size: 12px; padding: 2px 7px; border-radius: 10px; margin: 2px 3px 2px 0; color: #0d1117; font-weight: 600; }
   .hbar { display: -webkit-flex; display: flex; -webkit-align-items: center; align-items: center; font-size: 14px; margin: 6px 0; }
+  #sp-tbl .hbar { margin: 2px 0; } #sp-tbl .hbar .n { width: 70px; } #sp-tbl .hbar .v { width: 0; }
   .hbar .n { width: 190px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .hbar .t { -webkit-flex: 1; flex: 1; height: 16px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 0 10px; }
   .hbar .t i { display: block; height: 100%; }
@@ -65,6 +66,9 @@
   .legend span { font-size: 12px; margin-right: 10px; white-space: nowrap; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   pre { font: 11px Menlo, monospace; color: #c9d1d9; white-space: pre-wrap; word-break: break-all; margin: 0; max-height: 300px; overflow-y: auto; }
+  .pausebtn { display: block; text-align: center; background: #da3633; color: #fff; font-size: 24px; font-weight: 700; padding: 18px; border-radius: 14px; margin-bottom: 12px; letter-spacing: .3px; }
+  .pausebtn.on { background: #238636; }
+  .pausebtn:not(.on) { background: #da3633; }
   #alert { position: absolute; left: 0; right: 0; bottom: 0; background: #da3633; color: #fff; padding: 10px 16px; font-size: 15px; display: none; z-index: 5; }
   #alert .btn { float: right; margin-top: -4px; }
   #night { position: fixed; left: 0; top: 0; right: 0; bottom: 0; background: #000; z-index: 20; display: none; }
@@ -124,16 +128,24 @@
 
 <!-- NETWORK -->
 <div class="pg" id="pg-netw">
+  <a id="btn-wired" class="pausebtn">Wired internet: …</a>
   <div class="row">
-    <div class="col"><div class="card"><div class="lbl">Latency 24 h <span>internet ● landlord router ●</span></div><canvas id="c-lat" height="150"></canvas></div></div>
-    <div class="col"><div class="card"><div class="lbl">Internet traffic 24 h <span>↓ ● ↑ ●</span></div><canvas id="c-wan24" height="150"></canvas></div></div>
+    <div class="col"><div class="card"><div class="lbl">Latency <span><b style="color:#58a6ff">●</b> internet &nbsp;<b style="color:#d29922">●</b> landlord router &nbsp;<b style="color:#f85149">|</b> outage</span></div><canvas id="c-lat" height="150"></canvas></div></div>
+    <div class="col"><div class="card"><div class="lbl">Internet traffic <span><b style="color:#58a6ff">●</b> download &nbsp;<b style="color:#3fb950">●</b> upload</span></div><canvas id="c-wan24" height="150"></canvas></div></div>
   </div>
   <div class="row">
     <div class="col"><div class="card"><div class="lbl">Speed test <span><a class="btn green" id="btn-speed">Run test</a></span></div>
-      <div class="row" style="text-align:center;margin-bottom:8px"><div class="col"><div class="big" id="sp-d">--</div><div class="sub">Mbit/s down</div></div>
+      <div class="row" style="text-align:center;margin-bottom:4px"><div class="col"><div class="big" id="sp-d">--</div><div class="sub">Mbit/s down</div></div>
       <div class="col"><div class="big" id="sp-u">--</div><div class="sub">Mbit/s up</div></div><div class="col"><div class="big" id="sp-p">--</div><div class="sub">ms ping</div></div></div>
-      <canvas id="c-speed" height="90"></canvas></div>
-      <div class="card"><div class="lbl">Data usage</div><canvas id="c-usage" height="110"></canvas><div class="sub" id="usage-sub"></div></div>
+      <div class="sub" id="sp-when" style="text-align:center;margin-bottom:8px">No test yet</div>
+      <table id="sp-tbl"></table></div>
+      <div class="card"><div class="lbl">Data usage</div>
+      <div class="row" style="text-align:center;margin-bottom:6px">
+        <div class="col"><div class="big" id="us-td">--</div><div class="sub">today ↓</div></div>
+        <div class="col"><div class="big" id="us-tu">--</div><div class="sub">today ↑</div></div>
+        <div class="col"><div class="big" id="us-md">--</div><div class="sub">this month ↓</div></div>
+        <div class="col"><div class="big" id="us-mu">--</div><div class="sub">this month ↑</div></div></div>
+      <canvas id="c-usage" height="120"></canvas><div class="legend"><span><i style="background:#58a6ff"></i>download per hour</span><span><i style="background:#3fb950"></i>upload per hour</span></div></div>
     </div>
     <div class="col"><div class="card"><div class="lbl">Uplink Wi-Fi &amp; remote access</div><div id="netinfo"></div></div>
       <div class="card"><div class="lbl">Events <span><a class="btn" id="btn-ack">Clear alerts</a></span></div><div id="ev-all" style="max-height:330px;overflow-y:auto"></div></div></div>
@@ -143,8 +155,8 @@
 <!-- SYSTEM -->
 <div class="pg" id="pg-sys">
   <div class="row">
-    <div class="col"><div class="card"><div class="lbl">CPU % / memory % 24 h</div><canvas id="c-cpu" height="120"></canvas></div></div>
-    <div class="col"><div class="card"><div class="lbl">Temperature 24 h <span id="tempnow"></span></div><canvas id="c-temp" height="120"></canvas></div></div>
+    <div class="col"><div class="card"><div class="lbl">CPU / memory <span><b style="color:#58a6ff">●</b> CPU % &nbsp;<b style="color:#a371f7">●</b> memory %</span></div><canvas id="c-cpu" height="120"></canvas></div></div>
+    <div class="col"><div class="card"><div class="lbl">Temperature <span id="tempnow"></span></div><canvas id="c-temp" height="120"></canvas></div></div>
   </div>
   <div class="row">
     <div class="col"><div class="card"><div class="lbl">Top processes</div><table><tbody id="procs"></tbody></table></div>
@@ -160,12 +172,15 @@
     <div class="col"><div class="card"><div class="lbl">Traffic classifier (runs on the router)</div>
       <div class="row" style="text-align:center;margin-bottom:6px">
         <div class="col"><div class="big" id="ai-acc">--</div><div class="sub">test accuracy</div></div>
-        <div class="col"><div class="big" id="ai-live">--</div><div class="sub">agreement on your traffic</div></div>
-        <div class="col"><div class="big" id="ai-samp">--</div><div class="sub">training flows</div></div>
+        <div class="col"><div class="big" id="ai-loc">--</div><div class="sub">on your held-out flows</div></div>
+        <div class="col"><div class="big" id="ai-live">--</div><div class="sub">live agreement</div></div>
+        <div class="col"><div class="big" id="ai-samp">--</div><div class="sub">your flows learned</div></div>
       </div><div class="sub" id="ai-info"></div></div>
-      <div class="card"><div class="lbl">How flows were identified (now)</div><div id="ai-how"></div></div>
+      <div class="card"><div class="lbl">Models <span id="ai-w"></span></div><table id="ai-models"></table></div>
+      <div class="card"><div class="lbl">Learning curve <span><b style="color:#a371f7">●</b> ensemble live &nbsp;<b style="color:#58a6ff">●</b> forest live &nbsp;<b style="color:#3fb950">●</b> network live &nbsp;<b style="color:#d29922">●</b> local test</span></div><canvas id="c-learn" height="130"></canvas></div>
+      <div class="card"><div class="lbl">How flows were identified (now)</div><div id="ai-how"></div></div></div>
+    <div class="col"><div class="card"><div class="lbl">Accuracy per app (F1, held-out)</div><div id="ai-f1" style="max-height:420px;overflow-y:auto"></div></div>
       <div class="card"><div class="lbl">Most useful signals</div><div id="ai-feat"></div></div></div>
-    <div class="col"><div class="card"><div class="lbl">Accuracy per app (F1 on held-out flows)</div><div id="ai-f1" style="max-height:560px;overflow-y:auto"></div></div></div>
   </div>
 </div>
 
@@ -218,9 +233,11 @@
     g.strokeStyle = '#21262d'; g.lineWidth = 1;
     for (var i = 0; i <= 2; i++) { var y = Math.round(h - h * i / 2) + 0.5; g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
     series.forEach(function (s) {
-      g.beginPath(); var first = true, lastX = 0;
+      g.beginPath(); var first = true, lastX = 0, lastT = 0;
       s.pts.forEach(function (q) {
         if (q[1] == null) { first = true; return; }
+        if (lastT && q[0] - lastT > 180) first = true;   // gap in the data: don't draw across it
+        lastT = q[0];
         var x = (q[0] - t0) / (t1 - t0) * w, y = h - 1 - q[1] / max * (h - 6);
         if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y); lastX = x;
       });
@@ -246,6 +263,21 @@
     vals.forEach(function (v, i) { var hh = v / max * (h - 12); g.fillStyle = color; g.fillRect(i * bw + 2, h - hh, bw - 4, hh); });
     g.fillStyle = '#8b949e'; g.fillText(fmt ? fmt(max) : max, 3, 11);
     labels.forEach(function (l, i) { if (n > 12 && i % Math.ceil(n / 8)) return; g.fillStyle = '#6e7681'; g.fillText(l, i * bw + 2, p.h - 2); });
+  }
+  // rows: [label, a, b]; paired bars with a value axis
+  function bars2(c, rows, ca, cb, fmt) {
+    var p = prep(c), g = p.g, w = p.w - 44, h = p.h - 16, max = 1, n = rows.length || 1, bw = w / n;
+    rows.forEach(function (r) { if (r[1] > max) max = r[1]; if (r[2] > max) max = r[2]; });
+    g.strokeStyle = '#21262d'; g.fillStyle = '#6e7681';
+    for (var i = 0; i <= 2; i++) { var y = Math.round(h - (h - 6) * i / 2) + 0.5; g.beginPath(); g.moveTo(44, y); g.lineTo(p.w, y); g.stroke(); g.fillText(fmt(max * i / 2), 0, y + 4); }
+    rows.forEach(function (r, i) {
+      var x = 44 + i * bw, half = Math.max(1, bw / 2 - 1.5);
+      var ha = r[1] / max * (h - 6), hb = r[2] / max * (h - 6);
+      g.fillStyle = ca; g.fillRect(x + 1, h - ha, half, ha);
+      g.fillStyle = cb; g.fillRect(x + 1 + half + 1, h - hb, half, hb);
+      if (n <= 12 || i % Math.ceil(n / 12) === 0) { g.fillStyle = '#6e7681'; g.fillText(r[0], x + 1, p.h - 3); }
+    });
+    if (!rows.length) { g.fillStyle = '#6e7681'; g.fillText('collecting… vnStat saves every few minutes', 50, h / 2); }
   }
   function hbar(name, v, max, color, txt) {
     return '<div class="hbar"><div class="n">' + name + '</div><div class="t"><i style="width:' + Math.max(1, Math.round(100 * v / (max || 1))) + '%;background:' + color + '"></i></div><div class="v">' + txt + '</div></div>';
@@ -369,19 +401,33 @@
   // ---------- NETWORK / SYSTEM / AI ----------
   function renderHist() {
     var H = HIST; if (!H) return;
-    var now = Date.now() / 1000, t0 = now - 86400, h = H.hist || {};
+    var now = Date.now() / 1000, h = H.hist || {};
     var lat = h.lat || [], sys = h.sys || [], wan = h.wan || [];
+    // zoom to the data we have until a full day is recorded (min. 1 h window)
+    var first = lat.length ? lat[0][0] : now, t0 = Math.max(now - 86400, Math.min(first, now - 3600));
     var outages = lat.filter(function (r) { return r[2] === 100; }).map(function (r) { return r[0]; });
     if (page === 'netw') {
       lines($('c-lat'), [{ pts: lat.map(function (r) { return [r[0], r[1]]; }), color: '#58a6ff' }, { pts: lat.map(function (r) { return [r[0], r[3]]; }), color: '#d29922' }], { t0: t0, t1: now, fmt: function (v) { return Math.round(v) + ' ms'; }, marks: outages });
       lines($('c-wan24'), [{ pts: wan.map(function (r) { return [r[0], r[1] != null ? r[1] * 8 : null]; }), color: '#58a6ff' }, { pts: wan.map(function (r) { return [r[0], r[2] != null ? r[2] * 8 : null]; }), color: '#3fb950' }], { t0: t0, t1: now, fmt: bits });
       var st = H.speedtests || [];
-      if (st.length) { var l = st[st.length - 1]; $('sp-d').textContent = l.down; $('sp-u').textContent = l.up; $('sp-p').textContent = l.ping != null ? Math.round(l.ping) : '--'; }
-      bars($('c-speed'), st.map(function (x) { return x.down || 0; }), st.map(function (x) { return hm(x.t); }), '#58a6ff', function (v) { return v + ' Mb/s'; });
-      var day = (H.vnstat && H.vnstat.day) || [];
-      bars($('c-usage'), day.map(function (r) { return r[1] + r[2]; }), day.map(function (r) { var d = new Date(r[0] * 1000); return d.getDate() + '/' + (d.getMonth() + 1); }), '#a371f7', bytes);
-      var mon = (H.vnstat && H.vnstat.month) || [], lm = mon[mon.length - 1];
-      $('usage-sub').textContent = lm ? 'This month: ' + bytes(lm[1]) + ' down, ' + bytes(lm[2]) + ' up' : 'Collecting…';
+      if (st.length && !(LIVE && LIVE.speedtest)) {
+        var l = st[st.length - 1], sd = 0, su = 0;
+        st.forEach(function (x) { sd += x.down || 0; su += x.up || 0; });
+        $('sp-d').textContent = l.down != null ? Math.round(l.down) : '--'; $('sp-u').textContent = l.up != null ? Math.round(l.up) : '--';
+        $('sp-p').textContent = l.ping != null ? Math.round(l.ping) : '--';
+        $('sp-when').textContent = 'Last test ' + ago(l.t) + (st.length > 1 ? ' · average of ' + st.length + ' tests: ↓ ' + Math.round(sd / st.length) + ' / ↑ ' + Math.round(su / st.length) + ' Mbit/s' : '');
+      }
+      var mx = 1; st.forEach(function (x) { mx = Math.max(mx, x.down || 0, x.up || 0); });
+      $('sp-tbl').innerHTML = st.slice(-6).reverse().map(function (x) {
+        var d = new Date(x.t * 1000), when = (Date.now() / 1000 - x.t < 86400) ? hm(x.t) : (d.getDate() + '/' + (d.getMonth() + 1) + ' ' + hm(x.t));
+        return '<tr><td class="sub" style="width:70px">' + when + '</td><td>' + hbar('↓ ' + Math.round(x.down || 0), x.down || 0, mx, '#58a6ff', '') +
+          hbar('↑ ' + Math.round(x.up || 0), x.up || 0, mx, '#3fb950', '') + '</td><td class="r sub" style="width:60px">' + (x.ping != null ? Math.round(x.ping) + ' ms' : '') + '</td></tr>';
+      }).join('');
+      var V = H.vnstat || {}, hr = V.hour || [], dy = V.day || [], mo = V.month || [];
+      var td = dy[dy.length - 1], tm = mo[mo.length - 1];
+      $('us-td').textContent = td ? bytes(td[1]) : '--'; $('us-tu').textContent = td ? bytes(td[2]) : '--';
+      $('us-md').textContent = tm ? bytes(tm[1]) : '--'; $('us-mu').textContent = tm ? bytes(tm[2]) : '--';
+      bars2($('c-usage'), hr.slice(-24).map(function (r) { return [new Date(r[0] * 1000).getHours() + 'h', r[1], r[2]]; }), '#58a6ff', '#3fb950', bytes);
     }
     if (page === 'sys') {
       lines($('c-cpu'), [{ pts: sys.map(function (r) { return [r[0], r[1]]; }), color: '#58a6ff' }, { pts: sys.map(function (r) { return [r[0], r[2]]; }), color: '#a371f7' }], { t0: t0, t1: now, max: 100, fmt: function (v) { return v + '%'; } });
@@ -404,22 +450,36 @@
       '<div class="ev"><span class="dot ' + (px.upnp === 'ok' ? 'on' : 'bad') + '"></span>Roaming proxy ' + (px.upnp === 'ok' ? 'reachable' : 'not forwarded') + ' · ' + esc(px.pub) + ':' + esc(px.port) + '</div>' +
       '<div class="ev"><span class="dot ' + (ts.state === 'Running' ? 'on' : '') + '"></span>Tailscale ' + esc(ts.state) + (ts.exitNode ? ' · exit node' : '') + ' · ' + (ts.peers || []).filter(function (p) { return p.online; }).length + ' peers online</div>';
   }
+  function pct(x) { return x == null || isNaN(x) ? '--' : Math.round(x * 1000) / 10 + '%'; }
   function renderAI() {
     var st = APPS && APPS.stats; if (!st) return;
-    $('ai-acc').textContent = st.holdout_accuracy ? Math.round(st.holdout_accuracy * 1000) / 10 + '%' : '--';
-    var la = st.live_agreement_total || {};
-    $('ai-live').textContent = la.labelled ? Math.round(100 * la.agree / la.labelled) + '%' : '--';
-    var src = st.samples_by_source || {}, tot = (src.seed || 0) + (src.local || 0);
-    $('ai-samp').textContent = tot ? Math.round(tot / 1000) + 'k' : '--';
-    $('ai-info').innerHTML = 'Random forest, ' + (st.classes || []).length + ' apps, trained ' + (st.trained_at ? ago(st.trained_at) : '–') + (st.training ? ' <b>(retraining…)</b>' : '') +
-      '. Training data: ' + (src.seed || 0) + ' public flows (CESNET) + ' + (src.local || 0) + ' auto-labelled flows from your network. Agreement is measured on ' + (la.labelled || 0) + ' of your flows whose app was also visible by name.';
+    var lv = st.live || {}, lh = st.local_holdout || {}, src = st.samples_by_source || {}, w = st.weights || {};
+    $('ai-acc').textContent = pct(st.ens_holdout || st.holdout_accuracy);
+    $('ai-loc').textContent = lh.n ? pct(lh.ens) : '--';
+    $('ai-live').textContent = lv.ens && lv.ens.total ? pct(lv.ens.recent) : '--';
+    $('ai-samp').textContent = src.local || 0;
+    $('ai-info').innerHTML = (st.classes || []).length + ' apps · retrained ' + (st.trained_at ? ago(st.trained_at) : '–') + (st.training ? ' · <b>training now…</b>' : '') +
+      ' · ' + (st.online_updates || 0) + ' online network updates · training data ' + Math.round((src.seed || 0) / 1000) + 'k public + ' + (src.local || 0) + ' from your network (weighted 3×). ' +
+      '<br>Live agreement = how often the model, looking only at packet sizes and timing, names the same app as the TLS/QUIC name the flow revealed.';
+    var row = function (n, ho, loc, l) { return '<tr><td><b>' + n + '</b></td><td class="r">' + pct(ho) + '</td><td class="r">' + (lh.n ? pct(loc) : '--') + '</td><td class="r">' + (l && l.total ? pct(l.recent) + ' <span class="sub">(' + l.total + ')</span>' : '--') + '</td></tr>'; };
+    $('ai-models').innerHTML = '<tr><th></th><th class="r">public test</th><th class="r">your test</th><th class="r">live recent</th></tr>' +
+      row('Random forest', st.holdout_accuracy, lh.rf, lv.rf) + row('Neural network (online)', st.net_holdout, lh.net, lv.net) + row('Ensemble', st.ens_holdout, lh.ens, lv.ens);
+    $('ai-w').textContent = 'weights: forest ' + Math.round((w.rf || 0) * 100) + '% · network ' + Math.round((w.net || 0) * 100) + '%' + (lv.net_steps ? ' · ' + lv.net_steps + ' gradient steps' : '');
+    var hs = st.history || [];
+    if (page === 'ai' && hs.length) {
+      var t0 = hs[0].t, t1 = Math.max(hs[hs.length - 1].t, t0 + 3600);
+      var P = function (k) { return hs.filter(function (h) { return h[k] != null && (k.indexOf('live') < 0 || h[k] > 0); }).map(function (h) { return [h.t, h[k] * 100]; }); };
+      lines($('c-learn'), [{ pts: P('live_ens'), color: '#a371f7' }, { pts: P('live_rf'), color: '#58a6ff' }, { pts: P('live_net'), color: '#3fb950' },
+        { pts: hs.filter(function (h) { return h.kind === 'retrain' && h.local_acc_ens; }).map(function (h) { return [h.t, h.local_acc_ens * 100]; }), color: '#d29922' }],
+        { t0: t0, t1: t1, max: 100, fmt: function (v) { return Math.round(v) + '%'; } });
+    }
     var counts = {}, n = 0;
     (APPS.flows || []).forEach(function (f) { counts[f.how] = (counts[f.how] || 0) + 1; n++; });
     var names = { name: 'Name (TLS/QUIC/DNS)', address: 'Game server address', behaviour: 'Real-time pattern', model: 'AI model', none: 'Unidentified' }, h = '';
     Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).forEach(function (k) { h += hbar(names[k] || k, counts[k], n, k === 'model' ? '#a371f7' : k === 'none' ? '#484f58' : '#58a6ff', counts[k]); });
     $('ai-how').innerHTML = h || '<div class="sub">–</div>';
     var fh = '', tf = st.top_features || [], fm = tf.length ? tf[0].importance : 1;
-    tf.slice(0, 10).forEach(function (f) { fh += hbar(esc(f.name.replace(/_/g, ' ')), f.importance, fm, '#39c5cf', Math.round(f.importance * 1000) / 10 + '%'); });
+    tf.slice(0, 8).forEach(function (f) { fh += hbar(esc(f.name.replace(/_/g, ' ')), f.importance, fm, '#39c5cf', Math.round(f.importance * 1000) / 10 + '%'); });
     $('ai-feat').innerHTML = fh;
     var pc = st.per_class || {}, ks = Object.keys(pc).sort(function (a, b) { return pc[b].f1 - pc[a].f1; }), f1 = '';
     ks.forEach(function (k) { var A = activityOf(k); f1 += hbar(act(A)[1] + ' ' + esc(k), pc[k].f1, 1, act(A)[0], Math.round(pc[k].f1 * 100) + '%'); });
@@ -427,7 +487,7 @@
   }
 
   // ---------- polling ----------
-  function poll() { get('live', function (d) { LIVE = d; renderLive(); if (page === 'sys' || page === 'netw') renderSysLive(); }); }
+  function poll() { get('live', function (d) { LIVE = d; renderLive(); speedUI(); wiredUI(); if (page === 'sys' || page === 'netw') renderSysLive(); }); }
   function pollApps() {
     get('apps', function (d) {
       APPS = d;
@@ -449,7 +509,36 @@
     try { localStorage.setItem('page', page); } catch (e) {}
     renderLive(); renderRunning(); renderApps(); renderHist(); renderSysLive(); renderAI(); renderDevices(); pollLogs();
   });
-  $('btn-speed').addEventListener('click', function () { post('a=speedtest', function () { $('sp-d').textContent = '…'; setTimeout(pollHist, 30000); setTimeout(pollHist, 50000); }); });
+  function wiredUI() {
+    var off = LIVE && LIVE.wired_off, b = $('btn-wired'), ports = '';
+    ((LIVE && LIVE.wired_ports) || []).forEach(function (p) { ports += ' ' + (p.link ? '\u25CF' : '\u25CB'); });
+    if (off) { b.className = 'pausebtn on'; b.innerHTML = '\u26D4&nbsp; Wired internet is OFF &nbsp;<small style="font-weight:400">tap to switch on</small><div style="font-size:13px;font-weight:400;margin-top:4px">ports' + ports + ' · Wi-Fi unaffected</div>'; }
+    else { b.className = 'pausebtn'; b.innerHTML = '\u23F8&nbsp; Switch wired internet OFF<div style="font-size:13px;font-weight:400;margin-top:4px">ports' + ports + ' · Wi-Fi unaffected</div>'; }
+  }
+  $('btn-wired').addEventListener('click', function () {
+    var off = LIVE && LIVE.wired_off;
+    if (!off && !confirm('Switch off internet for all wired devices?')) return;
+    post('a=wired&on=' + (off ? '1' : '0'), function () { poll(); });
+    if (LIVE) LIVE.wired_off = !off; wiredUI();
+  });
+  var speedWas = null, speedStarted = 0;
+  function speedUI() {
+    var st = LIVE && LIVE.speedtest, btn = $('btn-speed');
+    if (st || Date.now() - speedStarted < 4000) {
+      btn.textContent = st === 'up' ? 'Testing upload…' : 'Testing download…';
+      btn.className = 'btn'; btn.style.opacity = '0.7';
+    } else {
+      btn.textContent = 'Run test'; btn.className = 'btn green'; btn.style.opacity = '1';
+    }
+    if (speedWas && !st) pollHist();   // test just finished: show the result now
+    speedWas = st;
+  }
+  $('btn-speed').addEventListener('click', function () {
+    if ((LIVE && LIVE.speedtest) || Date.now() - speedStarted < 4000) return;
+    speedStarted = Date.now(); speedWas = 'down';
+    $('sp-d').textContent = '…'; $('sp-u').textContent = '…'; $('sp-p').textContent = '…'; speedUI();
+    post('a=speedtest', function () { setTimeout(poll, 1500); });
+  });
   $('btn-ack').addEventListener('click', function () { post('a=ack', poll); });
   $('alertack').addEventListener('click', function () { post('a=ack', poll); });
 
