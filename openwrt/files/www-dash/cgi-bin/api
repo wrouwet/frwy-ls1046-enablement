@@ -1,0 +1,195 @@
+#!/usr/bin/ucode
+// Dashboard API.  ?q=live | hist | logs   ·   POST ?q=action (a=rename|known|forget|block|unblock|speedtest|ack)
+'use strict';
+import * as fs from 'fs';
+import * as ubus from 'ubus';
+import { cursor } from 'uci';
+
+const RUN = '/tmp/dash', PER = '/etc/dash', ROUTER_MAC = '02:0e:8e:76:23:29';
+
+function rj(p, d) { let s = fs.readfile(p); if (!s) return d; try { return json(s); } catch (e) { return d; } }
+function wj(p, v) { let t = p + '.tmp'; fs.writefile(t, sprintf('%J', v)); fs.rename(t, p); }
+function sh(c) { let p = fs.popen(c); if (!p) return ''; let s = p.read('all'); p.close(); return s || ''; }
+function rd(p) { let s = fs.readfile(p); return s ? trim(s) : null; }
+function dec(s) { return replace(replace(s || '', /\+/g, ' '), /%([0-9A-Fa-f]{2})/g, (m, h) => chr(hex(h))); }
+function parse(s) { let o = {}; for (let kv in split(s || '', '&')) { let i = index(kv, '='); if (i > 0) o[dec(substr(kv, 0, i))] = dec(substr(kv, i + 1)); } return o; }
+function reply(obj, code) {
+	print(sprintf('Status: %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n', code || '200 OK'));
+	print(sprintf('%J', obj));
+	exit(0);
+}
+
+let qs = parse(getenv('QUERY_STRING')), q = qs.q || 'live';
+let u = ubus.connect();
+
+function trusted() {
+	let ip = replace(getenv('REMOTE_ADDR') || '', /^::ffff:/, '');
+	if (match(ip, /^192\.168\.50\./) || match(ip, /^127\./)) return true;
+	let m = match(ip, /^100\.(\d+)\./);
+	return m && +m[1] >= 64 && +m[1] <= 127;
+}
+
+function blockedMacs() {
+	let c = cursor(), out = {};
+	c.foreach('firewall', 'rule', (s) => { if (match(s['.name'], /^dashblk_/) && s.src_mac) out[lc(s.src_mac)] = true; });
+	return out;
+}
+
+function devices() {
+	let devdb = rj(PER + '/devices.json', {}), rates = rj(RUN + '/rates.json', {}), blocked = blockedMacs();
+	let leases = {}, neigh = {}, assoc = {}, nl = {};
+	for (let l in split(fs.readfile('/tmp/dhcp.leases') || '', '\n')) {
+		let f = split(l, ' ');
+		if (length(f) >= 4) leases[lc(f[1])] = { ip: f[2], name: f[3] == '*' ? null : f[3], exp: +f[0] };
+	}
+	for (let l in split(sh('ip -4 neigh'), '\n')) {
+		let m = match(l, /^(\S+) dev (\S+) lladdr (\S+) (\S+)/);
+		if (m) neigh[lc(m[3])] = { ip: m[1], dev: m[2], state: m[4] };
+	}
+	try { for (let r in u.call('iwinfo', 'assoclist', { device: 'phy0-ap0' }).results) assoc[lc(r.mac)] = { sig: r.signal, ct: r.connected_time }; } catch (e) {}
+	try { let j = json(sh('nlbw -c json -g mac 2>/dev/null')); for (let r in j.data) nl[lc(r[0])] = { rx: r[2], tx: r[4], conns: r[1] }; } catch (e) {}
+
+	let macs = {};
+	for (let k in keys(devdb)) macs[k] = 1;
+	for (let k in keys(leases)) macs[k] = 1;
+	for (let k in keys(assoc)) macs[k] = 1;
+	for (let k, n in neigh) if (n.state != 'FAILED' && n.state != 'INCOMPLETE') macs[k] = 1;
+	for (let k in keys(nl)) if (k != '00:00:00:00:00:00') macs[k] = 1;
+
+	let out = [], now = time();
+	for (let mac in keys(macs)) {
+		let d = devdb[mac] || {}, l = leases[mac], n = neigh[mac], a = assoc[mac], r = rates[mac], t = nl[mac];
+		let seg = mac == ROUTER_MAC ? 'router' : (l || a || (n && n.dev == 'br-lan') || devdb[mac]) ? 'lan' : 'upstream';
+		let on = a != null || (n && index(['REACHABLE', 'DELAY', 'PROBE'], n.state) >= 0) || (r && r[0] + r[1] > 50) || (d.last && now - d.last < 180);
+		push(out, {
+			mac: mac, seg: seg,
+			name: d.name || (l && l.name) || d.lname || (mac == ROUTER_MAC ? 'This router (uplink)' : null),
+			ip: (l && l.ip) || (n && n.ip) || null,
+			online: !!on, wifi: a ? a.sig : null, wifiTime: a ? a.ct : null,
+			known: d.known != null ? d.known : (seg != 'lan'), first: d.first || null, last: d.last || null,
+			rx: t ? t.rx : 0, tx: t ? t.tx : 0, conns: t ? t.conns : 0,
+			rxr: r ? r[0] : 0, txr: r ? r[1] : 0, blocked: !!blocked[mac]
+		});
+	}
+	return out;
+}
+
+function live() {
+	let out = { t: time() };
+	try {
+		let si = u.call('system', 'info'), sb = u.call('system', 'board');
+		out.host = sb.hostname; out.model = sb.model; out.kernel = sb.kernel; out.release = sb.release ? sb.release.description : null;
+		out.uptime = si.uptime; out.load = map(si.load, (l) => l / 65536.0);
+		out.mem = { total: si.memory.total, avail: si.memory.available };
+		out.disk = { total: si.root.total * 1024, used: si.root.used * 1024 };
+	} catch (e) {}
+	out.temps = [];
+	for (let z in fs.glob('/sys/class/thermal/thermal_zone*')) {
+		let v = rd(z + '/temp');
+		if (v) push(out.temps, { name: replace(rd(z + '/type') || '', '-thermal', ''), c: +v / 1000.0 });
+	}
+	out.ifaces = {};
+	for (let i in ['phy0-sta0', 'br-lan', 'phy0-ap0', 'tailscale0']) {
+		let b = '/sys/class/net/' + i;
+		if (fs.stat(b)) out.ifaces[i] = { up: rd(b + '/operstate') != 'down', rx: +rd(b + '/statistics/rx_bytes'), tx: +rd(b + '/statistics/tx_bytes') };
+	}
+	let cl = split(split(fs.readfile('/proc/stat') || '', '\n')[0], /\s+/), tot = 0;
+	for (let i = 1; i < length(cl); i++) tot += +cl[i];
+	out.cpu = { total: tot, idle: +cl[4] + +cl[5] };
+	try { let w = u.call('iwinfo', 'info', { device: 'phy0-sta0' }); out.wifi = { ssid: w.ssid, signal: w.signal, quality: w.quality, qmax: w.quality_max, ch: w.channel }; } catch (e) {}
+	try { let w = u.call('iwinfo', 'info', { device: 'phy0-ap0' }); out.ap = { ssid: w.ssid, ch: w.channel }; } catch (e) {}
+	out.conntrack = +rd('/proc/sys/net/netfilter/nf_conntrack_count');
+	try {
+		let ts = json(sh('tailscale status --json 2>/dev/null')), peers = [];
+		for (let k, p in ts.Peer || {}) push(peers, { name: p.HostName, os: p.OS, online: !!p.Online, exit: !!p.ExitNode, ip: p.TailscaleIPs ? p.TailscaleIPs[0] : null, rx: p.RxBytes, tx: p.TxBytes });
+		out.tailscale = { state: ts.BackendState, ip: ts.TailscaleIPs ? ts.TailscaleIPs[0] : null, exitNode: !!(ts.Self && ts.Self.ExitNodeOption), peers: peers };
+	} catch (e) {}
+	let st = rj(RUN + '/state.json', {});
+	let lat = st.hist && st.hist.lat ? st.hist.lat[length(st.hist.lat) - 1] : null;
+	out.inet = { online: st.online, since: st.downSince, lat: lat ? lat[1] : null, loss: lat ? lat[2] : null, gw: lat ? lat[3] : null };
+	out.proxy = { pub: rd('/tmp/public_ip'), upnp: rd('/tmp/proxy_upnp'), port: cursor().get('squid', 'squid', 'http_port') };
+	out.devices = devices();
+	let evs = rj(PER + '/events.json', []), ack = +(rd(PER + '/ack') || 0), unack = [];
+	for (let e in evs) if (e.t > ack && e.level != 'good') push(unack, e);
+	out.alerts = unack;
+	out.speedtest = fs.stat(RUN + '/speedtest.running') ? rd(RUN + '/speedtest.running') : null;
+	out.trusted = trusted();
+	return out;
+}
+
+function vnstat() {
+	let c = RUN + '/vnstat.json', s = fs.stat(c);
+	if (s && time() - s.mtime < 60) return rj(c, {});
+	let o = {};
+	for (let m in [['h', 24, 'hour'], ['d', 31, 'day'], ['m', 12, 'month']]) {
+		try {
+			let j = json(sh(sprintf('vnstat --json %s %d -i phy0-sta0 2>/dev/null', m[0], m[1])));
+			o[m[2]] = map(j.interfaces[0].traffic[m[2]] || [], (r) => [r.timestamp, r.rx, r.tx]);
+		} catch (e) { o[m[2]] = []; }
+	}
+	wj(c, o);
+	return o;
+}
+
+function hist() {
+	let st = rj(RUN + '/state.json', {});
+	let svc = [];
+	try {
+		for (let name, s in u.call('service', 'list')) {
+			let n = 0, r = 0;
+			for (let k, i in s.instances || {}) { n++; if (i.running) r++; }
+			if (n) push(svc, { name: name, running: r, total: n });
+		}
+	} catch (e) {}
+	let evs = rj(PER + '/events.json', []);
+	return {
+		t: time(), hist: st.hist || {}, events: slice(evs, -60), speedtests: slice(rj(PER + '/speedtests.json', []), -30),
+		vnstat: vnstat(), procs: rj(RUN + '/procs.json', []), services: svc
+	};
+}
+
+function action() {
+	if (!trusted()) reply({ ok: false, error: 'actions are only allowed from the FRWY network, the proxy or Tailscale' }, '403 Forbidden');
+	let len = +(getenv('CONTENT_LENGTH') || 0);
+	let p = parse(len > 0 && len < 4096 ? fs.stdin.read(len) : '');
+	let mac = lc(p.mac || '');
+	if (p.a != 'speedtest' && p.a != 'ack' && !match(mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)) reply({ ok: false, error: 'bad mac' }, '400 Bad Request');
+	let devdb = rj(PER + '/devices.json', {});
+	if (p.a == 'rename' || p.a == 'known' || p.a == 'forget') {
+		let d = devdb[mac] || (devdb[mac] = { first: time(), last: 0 });
+		if (p.a == 'rename') { let n = substr(trim(replace(p.name || '', /[<>"&\r\n\t]/g, '')), 0, 40); if (length(n)) d.name = n; else delete d.name; d.known = true; }
+		if (p.a == 'known') d.known = true;
+		if (p.a == 'forget') delete devdb[mac];
+		wj(PER + '/devices.json', devdb);
+	} else if (p.a == 'block' || p.a == 'unblock') {
+		let c = cursor(), sid = 'dashblk_' + replace(mac, /:/g, '');
+		if (p.a == 'block') {
+			c.set('firewall', sid, 'rule');
+			c.set('firewall', sid, 'name', 'Dashboard block ' + mac);
+			c.set('firewall', sid, 'src', 'lan'); c.set('firewall', sid, 'dest', 'wan');
+			c.set('firewall', sid, 'src_mac', mac); c.set('firewall', sid, 'proto', 'all'); c.set('firewall', sid, 'target', 'REJECT');
+		} else c.delete('firewall', sid);
+		c.save('firewall'); c.commit('firewall');
+		system('/etc/init.d/firewall reload >/dev/null 2>&1');
+		if (p.a == 'block') {
+			let ip = null;
+			for (let l in split(sh('ip -4 neigh'), '\n')) { let m = match(l, /^(\S+) dev br-lan lladdr (\S+)/); if (m && lc(m[2]) == mac) ip = m[1]; }
+			if (ip) system(sprintf('conntrack -D -s %s >/dev/null 2>&1', ip));
+		}
+		let evs = rj(PER + '/events.json', []);
+		push(evs, { t: time(), level: 'warn', text: (p.a == 'block' ? 'Internet blocked for ' : 'Internet unblocked for ') + ((devdb[mac] && (devdb[mac].name || devdb[mac].lname)) || mac) });
+		wj(PER + '/events.json', slice(evs, -150));
+	} else if (p.a == 'speedtest') {
+		system('/usr/bin/ucode /usr/share/dash/speedtest.uc >/dev/null 2>&1 &');
+	} else if (p.a == 'ack') {
+		fs.writefile(PER + '/ack', '' + time());
+	} else reply({ ok: false, error: 'unknown action' }, '400 Bad Request');
+	reply({ ok: true });
+}
+
+if (q == 'live') reply(live());
+else if (q == 'hist') reply(hist());
+else if (q == 'apps') { print('Content-Type: application/json\r\nCache-Control: no-store\r\n\r\n'); print(sh('wget -qO- -T 3 http://127.0.0.1:8091/api/all 2>/dev/null') || '{}'); }
+else if (q == 'logs') reply({ lines: split(trim(sh('logread -l 80 2>/dev/null')), '\n') });
+else if (q == 'action') action();
+else reply({ error: 'unknown q' }, '400 Bad Request');

@@ -16,7 +16,7 @@ The long-term goal is a mesh networking node (prplMesh/EasyMesh or 802.11s).
 ## Current state
 
 - The box joins a known Wi-Fi network as its uplink and shares it through its
-  own access point (`FRWY-LS1046A`, WPA2/WPA3) and all four Ethernet ports, which
+  own access point (`FRWY-LS1046A`, WPA2 — WPA3/mixed mode locked out an iOS 10 client) and all four Ethernet ports, which
   form one LAN on 192.168.50.1/24 with DHCP.
 - `uplink-select` (in `openwrt/files/`) runs at boot. It chooses the best stored
   uplink and the matching channel, and recovers the radio when the uplink dies.
@@ -29,6 +29,9 @@ The long-term goal is a mesh networking node (prplMesh/EasyMesh or 802.11s).
 - **Filtering is deliberately off for now:** the firewall accepts everything in
   every zone (NAT stays on), and banIP, adblock, DNS-over-HTTPS and UPnP are
   disabled. Turn them on in LuCI when needed.
+- **Home monitor:** an old iPad on the wall shows a live dashboard and a root
+  console served by the box, and an encrypted-traffic classifier (`flowsense/`)
+  shows which apps each device is using. See *Home monitor* below.
 - `openwrt/config-snapshot/` holds the box's configuration and package list,
   with keys, passwords and the home network's name removed.
 
@@ -105,6 +108,23 @@ Every `mode sta` wifi-iface in `/etc/config/wireless` is a known uplink.
 
 Logs: `logread -e uplink-select`.
 
+## Home monitor
+
+Everything runs on the box; the iPad (or any browser) is only a screen.
+
+| Part | Where | What |
+|---|---|---|
+| Dashboard | `openwrt/files/www-dash/` | `http://192.168.50.1:8080` — tabs *Now* (apps running right now, internet, router vitals, events), *Devices* (presence, live rate, today's apps, rename, block/unblock internet), *Apps* (today by app/activity, who does what, 24 h stacked history), *Network* (latency/loss and traffic 24 h, speed test, data usage, events), *System* (CPU/memory/temperature 24 h, processes, services, live log), *AI* (classifier accuracy, live agreement, per-app F1, most useful signals). Night mode 23:00–07:00. ES5 for Safari 10. |
+| API | `www-dash/cgi-bin/api` (ucode) | live status, history, logs, flowsense passthrough; actions (rename, block, speed test, acknowledge) only from the LAN, the proxy or Tailscale. |
+| Watcher | `usr/share/dash/tick.uc`, `etc/init.d/dash-watch` | once a minute: latency to the internet and the upstream router, CPU, memory, temperature, uplink signal, conntrack, WAN rate (24 h history), device presence, top processes; events for outages, new devices, overheating, uplink loss, public-IP changes. |
+| Classifier | `flowsense/` | Go daemon: AF_PACKET capture on `br-lan`, 59 metadata features per flow, labels from TLS/QUIC SNI, DNS, HTTP/CONNECT, a random forest pre-trained on CESNET-TLS22/QUIC22 and retrained on the box from its own labelled flows. 93 % hold-out accuracy on the public data; live agreement on the home network is shown separately. |
+| Console | `www-dash/term*.html` + ttyd | xterm.js 3 page that iOS 10 can drive (input line, Esc/Tab/Ctrl/arrow keys). |
+| Roaming proxy | `etc/squid/`, `usr/libexec/squid-auth.sh`, `usr/sbin/proxy-upnp.sh` | squid with basic auth on a high port, forwarded on the upstream router by UPnP (renewed every 20 min); blocks private destinations except the dashboard and console. |
+| iPad setup | `ipad/` | restore, activation check, supervision and the configuration profile, all from Linux. |
+
+Install: copy `openwrt/files/` to `/`, run `openwrt/setup-dashboard.sh`, then
+`make deploy` in `flowsense/` (needs a seed dataset, see its README).
+
 ## Hardware findings
 
 - **QCA6174 interface combinations:** managed ≤ 2, AP/mesh point ≤ 2, total ≤ 4,
@@ -138,6 +158,18 @@ Logs: `logread -e uplink-select`.
   DNS-over-HTTPS. On a network that blocks DoH, every lookup then fails, and
   `wget` reports the misleading `Failed to send request: Operation not
   permitted`. It stays disabled.
+- **`wifi reload` can orphan the AP.** With the uplink and the AP sharing the
+  QCA6174, a light reload after an AP setting change recreated the client
+  interface but left the AP without a channel (`handle_probe_req: send failed`,
+  NO-CARRIER). A full `wifi down radio0; wifi up radio0` fixes it — run it
+  detached (`setsid sh -c '…' &`, there is no `nohup`), since SSH rides the same
+  radio.
+- **Two strongSwan daemons.** Both the `swanctl` and the legacy `ipsec`
+  (starter) services were enabled; the starter's charon hung in D state, was
+  killed and respawned every 15 s and kept the load average at ~2.2. Only
+  `swanctl` stays enabled.
+- **tinyproxy in the 25.12 feed is 1.11.1 without the CVE-2023-49606 fix**, so the
+  internet-facing proxy is squid.
 - **NetworkManager link-local profiles** grab the laptop's Ethernet whenever the
   link drops, so a DHCP client profile has to be brought up again after the box
   reboots.

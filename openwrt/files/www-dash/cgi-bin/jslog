@@ -1,0 +1,3 @@
+#!/bin/sh
+logger -t ipad-js "$(echo "$QUERY_STRING" | head -c 600)"
+printf 'Content-Type: image/gif\r\nAccess-Control-Allow-Origin: *\r\n\r\n'
